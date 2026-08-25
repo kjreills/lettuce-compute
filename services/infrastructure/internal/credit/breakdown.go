@@ -69,8 +69,13 @@ type CreditTimeline struct {
 // gRPC RPC (GetMyContribution), so the two surfaces cannot drift apart. The JSON
 // tags are the REST wire format.
 type VolunteerBreakdown struct {
-	VolunteerID    types.ID                      `json:"volunteer_id"`
-	TotalCredit    float64                       `json:"total_credit"`
+	VolunteerID types.ID                      `json:"volunteer_id"`
+	TotalCredit float64                       `json:"total_credit"`
+	// AdminGrantCredit is the volunteer's sum of operator-created credit grants
+	// (migration 00032) — positive entries NOT derived from validated results.
+	// It is ALREADY included in TotalCredit; this field exposes the slice of the
+	// total that came from grants rather than result-derived ledger rows.
+	AdminGrantCredit float64                       `json:"admin_grant_credit"`
 	ByLeaf         []LeafCredit                  `json:"by_leaf"`
 	ByHost         []HostCredit                  `json:"by_host"`
 	ByResourceType map[string]ResourceTypeCredit `json:"by_resource_type"`
@@ -155,6 +160,19 @@ func ComputeVolunteerBreakdown(ctx context.Context, pool *pgxpool.Pool, voluntee
 		"gpu":      {Credit: gpuCredit, WorkUnits: gpuWU},
 	}
 
+	// Operator-created credit grants (migration 00032) are not result-derived and
+	// have no leaf/host attribution, so they appear in none of the per-leaf /
+	// per-host rows above; they fold into the account totals and timelines here.
+	var grantTotal float64
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE(SUM(credit_amount), 0)::float8 FROM credit_grants WHERE volunteer_id = $1`,
+		volunteerID,
+	).Scan(&grantTotal); err != nil {
+		return nil, fmt.Errorf("query credit grants total: %w", err)
+	}
+	bd.AdminGrantCredit = grantTotal
+	bd.TotalCredit += grantTotal
+
 	// Per-host (per-machine) credit + resource usage. Each agreed result records
 	// the host that produced it; the optional hosts join resolves a friendly name
 	// and last-seen. host_id / last_seen are nil where unattributed.
@@ -191,13 +209,18 @@ func ComputeVolunteerBreakdown(ctx context.Context, pool *pgxpool.Pool, voluntee
 		return nil, fmt.Errorf("iterate per-host credit: %w", err)
 	}
 
-	// Daily timeline (last 30 days).
+	// Daily timeline (last 30 days) — result-derived credit UNIONed with grants.
 	bd.Timeline.Daily = make([]DailyCredit, 0)
 	dayRows, err := pool.Query(ctx, `
-		SELECT DATE(granted_at)::text AS day, SUM(credit_amount)
-		FROM credit_ledger
-		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '30 days'
-		GROUP BY day ORDER BY day`,
+		SELECT day, SUM(amount) FROM (
+			SELECT DATE(granted_at)::text AS day, credit_amount AS amount
+			FROM credit_ledger
+			WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '30 days'
+			UNION ALL
+			SELECT DATE(created_at)::text AS day, credit_amount AS amount
+			FROM credit_grants
+			WHERE volunteer_id = $1 AND created_at >= NOW() - INTERVAL '30 days'
+		) t GROUP BY day ORDER BY day`,
 		volunteerID,
 	)
 	if err != nil {
@@ -215,13 +238,18 @@ func ComputeVolunteerBreakdown(ctx context.Context, pool *pgxpool.Pool, voluntee
 		return nil, fmt.Errorf("iterate daily timeline: %w", err)
 	}
 
-	// Weekly timeline (last 12 weeks).
+	// Weekly timeline (last 12 weeks) — result-derived credit UNIONed with grants.
 	bd.Timeline.Weekly = make([]WeeklyCredit, 0)
 	weekRows, err := pool.Query(ctx, `
-		SELECT DATE_TRUNC('week', granted_at)::date::text AS week_start, SUM(credit_amount)
-		FROM credit_ledger
-		WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '12 weeks'
-		GROUP BY week_start ORDER BY week_start`,
+		SELECT week_start, SUM(amount) FROM (
+			SELECT DATE_TRUNC('week', granted_at)::date::text AS week_start, credit_amount AS amount
+			FROM credit_ledger
+			WHERE volunteer_id = $1 AND granted_at >= NOW() - INTERVAL '12 weeks'
+			UNION ALL
+			SELECT DATE_TRUNC('week', created_at)::date::text AS week_start, credit_amount AS amount
+			FROM credit_grants
+			WHERE volunteer_id = $1 AND created_at >= NOW() - INTERVAL '12 weeks'
+		) t GROUP BY week_start ORDER BY week_start`,
 		volunteerID,
 	)
 	if err != nil {

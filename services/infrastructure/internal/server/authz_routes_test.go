@@ -150,6 +150,8 @@ var authzRouteTable = []authzRoute{
 	{method: "GET", pattern: "/api/v1/admin/standing", tier: tierAdminGate, probeAllowed: true},
 	{method: "POST", pattern: "/api/v1/admin/credit/adjustments", tier: tierAdminGate},
 	{method: "GET", pattern: "/api/v1/admin/credit/adjustments", tier: tierAdminGate, probeAllowed: true},
+	{method: "POST", pattern: "/api/v1/admin/credit/grants", tier: tierAdminGate},
+	{method: "GET", pattern: "/api/v1/admin/credit/grants", tier: tierAdminGate, probeAllowed: true},
 	{method: "POST", pattern: "/api/v1/admin/audit/runners", tier: tierAdminGate},
 	{method: "POST", pattern: "/api/v1/admin/audit/runners/deactivate", tier: tierAdminGate},
 	{method: "GET", pattern: "/api/v1/admin/audit/runners", tier: tierAdminGate, probeAllowed: true},

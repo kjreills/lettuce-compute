@@ -399,6 +399,14 @@ func NewRouter(deps *Dependencies) (http.Handler, func()) {
 	mux.HandleFunc("POST /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleClawback))
 	mux.HandleFunc("GET /api/v1/admin/credit/adjustments", authAdmin(creditAdminHandler.HandleListAdjustments))
 
+	// Operator credit grants (admin API key): positive entries NOT derived from a
+	// validated result — for settling compute the head cannot see (e.g. inference
+	// requests counted by an external coordinator). Append-only; see migration 00032.
+	grantsRepo := credit.NewPgxGrantsRepository(deps.Pool)
+	creditAdminHandler.WithGrantsRepo(grantsRepo)
+	mux.HandleFunc("POST /api/v1/admin/credit/grants", authAdmin(creditAdminHandler.HandleGrant))
+	mux.HandleFunc("GET /api/v1/admin/credit/grants", authAdmin(creditAdminHandler.HandleListGrants))
+
 	// Result-audit administration (operator-only — admin API key). The trusted-runner
 	// registry (register / deactivate / list — registry membership is what authorizes the
 	// AuditService claim/submit surface AND upgrades the trust-accrual witness rule) plus

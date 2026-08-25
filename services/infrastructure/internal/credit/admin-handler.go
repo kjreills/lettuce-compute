@@ -38,6 +38,7 @@ type AdminHandler struct {
 	adjRepo           AdjustmentsRepository
 	ledgerRepo        Repository
 	revocationEmitter RevocationEmitter
+	grantsRepo        GrantsRepository
 	logger            *slog.Logger
 }
 
@@ -58,6 +59,14 @@ type RevocationEmitter interface {
 // router wires this setter. Returns h for chaining.
 func (h *AdminHandler) WithRevocationEmitter(e RevocationEmitter) *AdminHandler {
 	h.revocationEmitter = e
+	return h
+}
+
+// WithGrantsRepo attaches the grants repository backing the operator grant
+// endpoints. Additive like WithRevocationEmitter: without it the grant endpoints
+// fail closed with 500 rather than silently writing nowhere.
+func (h *AdminHandler) WithGrantsRepo(g GrantsRepository) *AdminHandler {
+	h.grantsRepo = g
 	return h
 }
 
@@ -243,4 +252,139 @@ func (h *AdminHandler) HandleListAdjustments(w http.ResponseWriter, r *http.Requ
 		adjustments = []*Adjustment{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"data": adjustments})
+}
+
+// grantRequest is the body of POST /api/v1/admin/credit/grants. Unlike a clawback —
+// which compensates an existing result-derived ledger entry — a grant creates positive
+// credit from nothing, keyed only to the volunteer. It exists for credit the head
+// cannot derive itself (e.g. inference requests the coordinator counted): the
+// operator settles from the coordinator's numbers and records the decision here.
+type grantRequest struct {
+	VolunteerID string   `json:"volunteer_id"`
+	Amount      *float64 `json:"amount"`
+	Reason      string   `json:"reason"`
+	Note        string   `json:"note"`
+}
+
+// HandleGrant handles POST /api/v1/admin/credit/grants: append one positive,
+// append-only grant row for a volunteer. The amount must be positive and finite;
+// the reason is the same uppercase machine code the clawback endpoint requires.
+// No attestation is emitted — grants create nothing to revoke retroactively; a
+// mistaken grant is corrected by operator decision.
+func (h *AdminHandler) HandleGrant(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	if h.grantsRepo == nil {
+		apierror.WriteError(w, apierror.Internal("credit grants are not configured on this head", nil))
+		return
+	}
+
+	var req grantRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		apierror.WriteError(w, apierror.ValidationError("invalid request body", nil))
+		return
+	}
+
+	volunteerID, err := types.ParseID(strings.TrimSpace(req.VolunteerID))
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("volunteer_id is not a valid id", nil))
+		return
+	}
+
+	if req.Amount == nil {
+		apierror.WriteError(w, apierror.ValidationError("amount is required", nil))
+		return
+	}
+	a := *req.Amount
+	if math.IsNaN(a) || math.IsInf(a, 0) || a <= 0 {
+		apierror.WriteError(w, apierror.ValidationError(
+			"amount must be a positive, finite number", nil))
+		return
+	}
+
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		apierror.WriteError(w, apierror.ValidationError("reason is required", nil))
+		return
+	}
+	if len(reason) > maxReasonLength {
+		apierror.WriteError(w, apierror.ValidationError(
+			"reason must be at most 64 characters", nil))
+		return
+	}
+	if !reasonCodeRe.MatchString(reason) {
+		apierror.WriteError(w, apierror.ValidationError(
+			"reason must be an uppercase machine code matching ^[A-Z0-9_]{1,64}$", nil))
+		return
+	}
+
+	grant, err := h.grantsRepo.Create(r.Context(), volunteerID, a, reason, strings.TrimSpace(req.Note), AdjustmentByOperator)
+	if err != nil {
+		l.Error("failed to create credit grant", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+
+	l.Info("credit grant recorded",
+		"grant_id", grant.ID,
+		"volunteer_id", grant.VolunteerID,
+		"amount", grant.CreditAmount,
+		"reason", grant.Reason,
+	)
+
+	writeJSON(w, http.StatusCreated, grant)
+}
+
+// HandleListGrants handles GET /api/v1/admin/credit/grants?volunteer_id=&limit=&offset=:
+// list one volunteer's grants, newest first. Same paging contract as HandleListAdjustments.
+func (h *AdminHandler) HandleListGrants(w http.ResponseWriter, r *http.Request) {
+	if !h.requireAdmin(w, r) {
+		return
+	}
+	l := logging.LoggerFromContext(r.Context(), h.logger)
+
+	raw := strings.TrimSpace(r.URL.Query().Get("volunteer_id"))
+	if raw == "" {
+		apierror.WriteError(w, apierror.ValidationError("volunteer_id is required", nil))
+		return
+	}
+	volunteerID, err := types.ParseID(raw)
+	if err != nil {
+		apierror.WriteError(w, apierror.ValidationError("volunteer_id is not a valid id", nil))
+		return
+	}
+
+	limit := defaultAdjustmentListLimit
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			apierror.WriteError(w, apierror.ValidationError("limit must be a positive integer", nil))
+			return
+		}
+		if n > maxAdjustmentListLimit {
+			n = maxAdjustmentListLimit
+		}
+		limit = n
+	}
+
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			apierror.WriteError(w, apierror.ValidationError("offset must be a non-negative integer", nil))
+			return
+		}
+		offset = n
+	}
+
+	grants, err := h.grantsRepo.ListByVolunteer(r.Context(), volunteerID, limit, offset)
+	if err != nil {
+		l.Error("failed to list credit grants", "error", err, "volunteer_id", volunteerID)
+		apierror.WriteError(w, apierror.FromError(err))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": grants})
 }
