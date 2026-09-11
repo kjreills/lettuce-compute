@@ -38,6 +38,12 @@ type PersistedTask struct {
 	ElapsedAccruedSeconds   int64             `json:"elapsed_accrued_seconds,omitempty"`
 	PausedAccruedSeconds    int64             `json:"paused_accrued_seconds,omitempty"`
 	PID                     int               `json:"pid,omitempty"` // OS PID for resuming suspended orphans
+	// ContainerID is the engine id of a container unit's container, recorded so
+	// the next launch can unpause and adopt it (a container has no PID to
+	// resume by). Empty for native units and before the container exists. A
+	// quit that suspended the unit leaves the container paused; without the id
+	// the relaunch re-ran the unit beside its frozen twin (TB-74).
+	ContainerID             string            `json:"container_id,omitempty"`
 	// ReservedUntilUnix and FetchedAt are used for buffered (not-yet-started) tasks
 	// persisted from the prefetch queue: the reservation window drives the on-resume
 	// lapse check, and the fetch time drives the deadline-expiry check, so a restored
@@ -50,6 +56,17 @@ type PersistedTask struct {
 type PersistedState struct {
 	SavedAt time.Time       `json:"saved_at"`
 	Tasks   []PersistedTask `json:"tasks"`
+}
+
+// normalizeRuntimeNames brings every persisted task's runtime name to the
+// canonical form (runtime.NormalizeRuntimeName). A file written by a build
+// before TB-76 carries the head's spelling ("CONTAINER"); the resumed unit's
+// comparisons — the runtime lookup, the exit-137 memory diagnosis — read the
+// canonical one.
+func normalizeRuntimeNames(state *PersistedState) {
+	for i := range state.Tasks {
+		state.Tasks[i].RuntimeName = runtime.NormalizeRuntimeName(state.Tasks[i].RuntimeName)
+	}
 }
 
 func activeTasksPath(dataDir string) string {
@@ -84,6 +101,7 @@ func LoadActiveState(dataDir string) (*PersistedState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parsing active tasks: %w", err)
 	}
+	normalizeRuntimeNames(&state)
 	return &state, nil
 }
 
@@ -127,6 +145,7 @@ func LoadBufferState(dataDir string) (*PersistedState, error) {
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("parsing buffered tasks: %w", err)
 	}
+	normalizeRuntimeNames(&state)
 	return &state, nil
 }
 

@@ -38,9 +38,34 @@ type MockDockerClient struct {
 	ContainerListFn        func(ctx context.Context, labelKey string) ([]ContainerSummary, error)
 	ContainerPauseFn       func(ctx context.Context, containerID string) error
 	ContainerUnpauseFn     func(ctx context.Context, containerID string) error
+	ContainerUpdateCPUFn   func(ctx context.Context, containerID string, quota, period int64) error
+	ContainerCPUNanosFn    func(ctx context.Context, containerID string) (uint64, error)
 
 	// Capture the last ContainerCreate config for assertions.
 	LastCreateConfig *ContainerConfig
+	// CPUUpdates records every ContainerUpdateCPU call (TB-75).
+	CPUUpdates []CPUUpdateCall
+}
+
+// CPUUpdateCall is one recorded ContainerUpdateCPU call.
+type CPUUpdateCall struct {
+	ContainerID   string
+	Quota, Period int64
+}
+
+func (m *MockDockerClient) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
+	if m.ContainerCPUNanosFn != nil {
+		return m.ContainerCPUNanosFn(ctx, containerID)
+	}
+	return 0, nil
+}
+
+func (m *MockDockerClient) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
+	m.CPUUpdates = append(m.CPUUpdates, CPUUpdateCall{ContainerID: containerID, Quota: quota, Period: period})
+	if m.ContainerUpdateCPUFn != nil {
+		return m.ContainerUpdateCPUFn(ctx, containerID, quota, period)
+	}
+	return nil
 }
 
 func (m *MockDockerClient) Ping(ctx context.Context) error {
@@ -324,8 +349,14 @@ func TestContainerRuntime_PrepareDockerUnavailable(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error when Docker is unavailable")
 	}
-	if !strings.Contains(err.Error(), "docker is not available") {
-		t.Errorf("error = %q, want to contain 'docker is not available'", err)
+	// An engine that does not answer the ping is reported as an outage of
+	// the runtime, not as this unit's failure (TB-80): the daemon returns the
+	// unit un-run and takes the runtime out of service on this error type.
+	if !IsEngineUnreachable(err) {
+		t.Errorf("error = %q, want an EngineUnreachableError", err)
+	}
+	if !strings.Contains(err.Error(), "container engine unreachable") {
+		t.Errorf("error = %q, want to contain 'container engine unreachable'", err)
 	}
 }
 
@@ -667,7 +698,7 @@ func TestContainerRuntime_ExecuteMemoryLimit(t *testing.T) {
 func TestContainerRuntime_ExecuteCPULimit(t *testing.T) {
 	mock := &MockDockerClient{}
 	cr, _ := newTestContainerRuntime(t, mock)
-	cr.SetMaxCPUCores(2)
+	cr.SetCPUBudget(2)
 
 	wu := &WorkUnit{
 		ID:            "505885bb-386c-478a-8204-36832e02431a", // was cpu-1

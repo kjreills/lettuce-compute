@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,25 +16,48 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/lettuce-compute/infrastructure/netguard"
 )
 
 // ContainerRuntime executes work units inside Docker containers.
 type ContainerRuntime struct {
-	dataDir       string
-	logger        *slog.Logger
-	dockerClient  DockerClient
-	backend       ContainerBackend // which container backend (podman, docker)
-	maxCPUCores   int              // from config; 0 means no CPU limit
+	dataDir      string
+	logger       *slog.Logger
+	dockerClient DockerClient
+	backend      ContainerBackend // which container backend (podman, docker)
+	// engineSocket is where the engine's API was reached (a Unix socket path,
+	// a Windows named pipe, or the Docker host string), kept so an outage can
+	// be reported with the one fact the volunteer can act on (TB-80). Empty
+	// for a runtime built without a detector.
+	engineSocket string
+	// cpuGrant answers "what CPU does a task starting now get": its equal
+	// share of the volunteer's CPU budget and the budget itself (TB-75). The
+	// daemon wires the live source (the budget divided among the running
+	// tasks); until then, and outside the daemon, it is the whole budget.
+	// Nil means no CPU limit.
+	cpuGrant      func() CPUGrant
 	gpus          []*GpuDetectionResult
 	maxGPUVRAMPct int
-	memCeilingMB  int // volunteer's configured memory budget (0 = unset); clamps per-unit BookedMemMB
+	memCeilingMB  int // the memory budget container work is given (0 = unset); clamps per-unit BookedMemMB
+	// memCeiling, when set, answers the same question live: the daemon wires
+	// its memory budget here so a limit changed while the daemon runs reaches
+	// the ceiling at once, the way a changed CPU budget reaches cpuGrant
+	// (TB-79). memCeilingMB is the figure in force until then, and outside the
+	// daemon (the audit runner).
+	memCeiling    func() int
 	diskCeilingMB int // volunteer's configured disk budget in MB (0 = unset); clamps per-unit BookedDiskMB
-	maxPids       int // fork-bomb PID cap from config (<=0 = built-in default)
-	capAdd        []string
-	gpuRelaxUser  bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
-	httpClient    *http.Client // for viz bundle downloads
+	// engineMemMB is the memory of the virtual machine the engine runs inside,
+	// as the engine reported it, when it runs inside one (macOS/Windows); 0 on a
+	// host whose containers share its RAM (Linux) or when the engine did not
+	// say. It is the fact behind a memCeilingMB below the configured budget
+	// (TB-63) and is reported so diagnostics can name it.
+	engineMemMB  int
+	maxPids      int // fork-bomb PID cap from config (<=0 = built-in default)
+	capAdd       []string
+	gpuRelaxUser bool         // BG-13 GPU carve-out: relax non-root/caps for GPU leaves
+	httpClient   *http.Client // for viz bundle downloads
 
 	// wantedImages, when set, returns every image ref the volunteer currently
 	// wants cached (all enabled leaves across all heads). The stale-image reaper
@@ -87,18 +111,41 @@ func NewContainerRuntimeForBackend(dataDir string, logger *slog.Logger, backend 
 		if err != nil {
 			return nil, fmt.Errorf("connect to docker: %w", err)
 		}
-		logger.Info("using Docker container backend")
+		// Label by what answers the socket, not by which probe found it: a
+		// Podman Desktop / podman-mac-helper host serves the Docker socket from
+		// Podman, and "using Docker" sent a tester chasing Docker settings that
+		// do not exist there (TB-54).
+		if backend.Engine == "podman" {
+			logger.Info("using Docker-compatible container backend served by Podman", "engine", backend.Engine)
+		} else {
+			logger.Info("using Docker container backend", "engine", backend.Engine)
+		}
 	default:
 		return nil, fmt.Errorf("no container runtime available")
 	}
 
+	socket := backend.SocketPath
+	if socket == "" && backend.Backend == BackendDocker {
+		socket = dockerHostForDisplay()
+	}
 	return &ContainerRuntime{
 		dataDir:      dataDir,
 		logger:       logger,
 		dockerClient: dc,
 		backend:      backend.Backend,
+		engineSocket: socket,
 		httpClient:   NewGuardedHTTPClient(),
 	}, nil
+}
+
+// dockerHostForDisplay names the Docker socket the default client connects
+// to — the DOCKER_HOST override when set, else the platform default — for
+// the outage message; the connection itself is the SDK's own FromEnv.
+func dockerHostForDisplay() string {
+	if h := strings.TrimSpace(os.Getenv("DOCKER_HOST")); h != "" {
+		return h
+	}
+	return client.DefaultDockerHost
 }
 
 // SetBackend sets the container backend (for testing).
@@ -106,9 +153,46 @@ func (c *ContainerRuntime) SetBackend(b ContainerBackend) {
 	c.backend = b
 }
 
-// SetMaxCPUCores sets the CPU core limit from volunteer config.
-func (c *ContainerRuntime) SetMaxCPUCores(cores int) {
-	c.maxCPUCores = cores
+// Backend reports which engine this runtime is connected to.
+func (c *ContainerRuntime) Backend() ContainerBackend {
+	return c.backend
+}
+
+// SetCPUBudget gives the runtime a fixed CPU budget: every container it
+// starts is granted the whole of it. This is the grant in force until the
+// daemon wires the live one (SetCPUGrantSource), and the right one where no
+// daemon shares the budget among concurrent tasks (the audit runner).
+func (c *ContainerRuntime) SetCPUBudget(cores int) {
+	c.cpuGrant = staticCPUGrant(cores)
+}
+
+// SetCPUGrantSource wires the daemon's live CPU grant: the source is asked,
+// at the moment a container is created, what share of the budget a task
+// starting now is given (TB-75). Later changes to a running container's share
+// arrive through SetContainerCPU.
+func (c *ContainerRuntime) SetCPUGrantSource(fn func() CPUGrant) {
+	c.cpuGrant = fn
+}
+
+// currentCPUGrant is the grant a task starting now receives.
+func (c *ContainerRuntime) currentCPUGrant() CPUGrant {
+	if c.cpuGrant == nil {
+		return CPUGrant{}
+	}
+	return c.cpuGrant()
+}
+
+// SetContainerCPU gives a running container a new CPU share: its quota is
+// rewritten in place through the engine's update call, so the sum of the
+// running containers' quotas follows the budget as tasks start and finish
+// (TB-75). A share of 0 removes the cap.
+func (c *ContainerRuntime) SetContainerCPU(ctx context.Context, containerID string, shareCores float64) error {
+	quota, period := CFSQuota(shareCores)
+	if err := c.dockerClient.ContainerUpdateCPU(ctx, containerID, quota, period); err != nil {
+		return err
+	}
+	c.logger.Debug("container CPU share updated", "container", shortImageID(containerID), "cores", FormatCores(shareCores), "quota", quota, "period", period)
+	return nil
 }
 
 // SetGPUs sets the detected GPUs available for container execution.
@@ -121,10 +205,35 @@ func (c *ContainerRuntime) SetMaxGPUVRAMPct(pct int) {
 	c.maxGPUVRAMPct = pct
 }
 
-// SetMemoryCeilingMB sets the volunteer's configured memory budget
-// (config.ResourceLimits.MaxMemoryMB). Per-unit enforcement clamps the declared
+// SetMemoryCeilingMB sets the memory budget container work is given: the
+// volunteer's configured budget (config.ResourceLimits.MaxMemoryMB), clipped to
+// the engine VM's memory less headroom where the engine runs inside a VM
+// (ContainerMemoryBudgetMB, TB-63). Per-unit enforcement clamps the declared
 // memory to this ceiling via BookedMemMB so enforcement matches admission (BG-16).
 func (c *ContainerRuntime) SetMemoryCeilingMB(mb int) { c.memCeilingMB = mb }
+
+// SetMemoryCeilingSource wires the daemon's live memory budget as the
+// ceiling: asked at the moment a container is created, so a memory limit
+// changed while the daemon runs is enforced on the next unit without a
+// restart, and enforcement never drifts from what admission books (TB-79).
+func (c *ContainerRuntime) SetMemoryCeilingSource(fn func() int) { c.memCeiling = fn }
+
+// MemoryCeilingMB reports the memory budget container work is given (0 =
+// unset): the live source when the daemon wired one, else the static figure.
+func (c *ContainerRuntime) MemoryCeilingMB() int {
+	if c.memCeiling != nil {
+		return c.memCeiling()
+	}
+	return c.memCeilingMB
+}
+
+// SetEngineMemoryMB records the memory of the VM the engine runs inside, as
+// the engine reported it (EngineInfo.MemTotalMB); 0 when the engine does not
+// run inside a VM or did not report it.
+func (c *ContainerRuntime) SetEngineMemoryMB(mb int) { c.engineMemMB = mb }
+
+// EngineMemoryMB reports the memory of the VM the engine runs inside, or 0.
+func (c *ContainerRuntime) EngineMemoryMB() int { return c.engineMemMB }
 
 // SetDiskCeilingMB sets the volunteer's configured disk budget in MB
 // (config.ResourceLimits.MaxDiskGB * 1024). The /work size watchdog and any
@@ -312,10 +421,15 @@ func screenImageRegistry(ctx context.Context, image string) error {
 }
 
 // Name returns "container".
-func (c *ContainerRuntime) Name() string { return "container" }
+func (c *ContainerRuntime) Name() string { return RuntimeContainer }
 
 // Client returns the underlying DockerClient for suspend/resume operations.
 func (c *ContainerRuntime) Client() DockerClient { return c.dockerClient }
+
+// EngineSocket reports where this runtime reaches its engine's API (a Unix
+// socket path, a Windows named pipe, or the Docker host string), for outage
+// reporting; empty for a runtime built without a detector.
+func (c *ContainerRuntime) EngineSocket() string { return c.engineSocket }
 
 // CanHandle returns true if the spec has an OCI image reference.
 func (c *ContainerRuntime) CanHandle(spec *ExecutionSpec) bool {
@@ -334,9 +448,15 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 		return nil, err
 	}
 
-	// Verify Docker daemon is accessible.
+	// Verify the engine is accessible. A ping that fails is an engine OUTAGE,
+	// not this unit's failure: it is reported as such so the daemon returns the
+	// unit un-run and takes the runtime out of service instead of billing the
+	// abandon and counting it toward the prepare breaker (TB-80).
 	if err := c.dockerClient.Ping(ctx); err != nil {
-		return nil, fmt.Errorf("docker is not available: %w", err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, fmt.Errorf("docker is not available: %w", err)
+		}
+		return nil, c.engineUnreachable(err)
 	}
 
 	// Create work directory structure. The checkpoint dir is bind-mounted rw into the
@@ -420,12 +540,18 @@ func (c *ContainerRuntime) Prepare(ctx context.Context, wu *WorkUnit) (*PrepareR
 	if strings.Contains(image, "@sha256:") {
 		if !exists {
 			if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+				if isEngineConnectionError(err) {
+					return nil, c.engineUnreachable(err)
+				}
 				return nil, interpretPullError(c.backend, image, err)
 			}
 			pulled = true
 		}
 	} else {
 		if err := c.dockerClient.ImagePull(ctx, image); err != nil {
+			if isEngineConnectionError(err) {
+				return nil, c.engineUnreachable(err)
+			}
 			if !exists {
 				return nil, interpretPullError(c.backend, image, err)
 			}
@@ -516,6 +642,12 @@ func isDiskExhaustionError(err error) bool {
 
 // Execute runs the work unit in a Docker container and returns results.
 func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	// A container a previous session left for this unit, reported running by
+	// ResumeWorkUnitContainer: supervise it instead of starting a second one.
+	if prep.OrphanContainerID != "" {
+		return c.adoptContainer(ctx, wu, prep)
+	}
+
 	c.logger.Info("executing work unit", "work_unit_id", wu.ID, "leaf_id", wu.LeafID, "runtime", wu.Runtime)
 
 	inputDir := filepath.Join(prep.WorkDir, "input")
@@ -534,8 +666,13 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		return nil, err
 	}
 
+	// The CPU this task is given: its share of the volunteer's budget, read
+	// once here so the quota enforced and the figure the task is told agree
+	// (TB-75).
+	cpu := c.currentCPUGrant()
+
 	// Build environment variables.
-	env := make([]string, 0, len(wu.EnvVars)+8)
+	env := make([]string, 0, len(wu.EnvVars)+13)
 	for k, v := range wu.EnvVars {
 		env = append(env, k+"="+v)
 	}
@@ -548,6 +685,10 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		"LETTUCE_CHECKPOINT_DIR=/work/checkpoint",
 		"LETTUCE_CHECKPOINT_FILE=/work/checkpoint/checkpoint.dat",
 	)
+	// Tell the task its CPU share (LETTUCE_CPU_LIMIT and the thread-pool
+	// knobs), so it sizes its workers to what it was given rather than to the
+	// CPUs it can see — inside a container that is every CPU of the machine.
+	env = append(env, cpu.Env()...)
 
 	// GPU passthrough.
 	var selectedGPU *GpuDetectionResult
@@ -583,14 +724,14 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 	// a declared 0 is bounded to the per-task default (never Docker's unlimited-0) and
 	// a huge declaration is clamped to the volunteer's configured budget. The container
 	// can therefore never exceed what admission booked for it.
-	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.memCeilingMB)
+	bookedMemMB := BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), c.MemoryCeilingMB())
 	memoryBytes := int64(bookedMemMB) * 1024 * 1024
 
-	var cpuQuota, cpuPeriod int64
-	if c.maxCPUCores > 0 {
-		cpuPeriod = 100000
-		cpuQuota = int64(c.maxCPUCores) * cpuPeriod
-	}
+	// The CPU quota is this task's SHARE of the budget, not the whole budget:
+	// every container used to be given max_cpu_cores of its own, so N running
+	// containers could use N times the limit (TB-75). The share is adjusted
+	// live as other tasks start and finish (SetContainerCPU).
+	cpuQuota, cpuPeriod := CFSQuota(cpu.ShareCores)
 
 	// Network mode.
 	networkMode := "none"
@@ -615,6 +756,7 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		Labels: map[string]string{
 			WorkUnitIDLabel:   wu.ID,
 			"lettuce.leaf-id": wu.LeafID,
+			DataDirLabel:      c.dataDir,
 		},
 	}
 
@@ -646,26 +788,85 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 		}
 	}
 
+	// A container of this unit from a previous session — one the relaunch could
+	// not adopt, or a stop the engine never confirmed — would run beside the new
+	// one on the same work dir, holding its memory (TB-74): make the new
+	// container the unit's only one.
+	if n := c.RemoveWorkUnitContainers(ctx, wu.ID, ""); n > 0 {
+		c.logger.Info("removed leftover containers of this unit before starting a new one", "work_unit_id", wu.ID, "removed", n)
+	}
+
 	// Create container.
 	containerID, err := c.dockerClient.ContainerCreate(ctx, cfg)
 	if err != nil {
+		if isEngineConnectionError(err) {
+			// The engine is gone, not the unit: reported as an outage so the
+			// daemon pauses container work instead of blaming the leaf (TB-80).
+			c.logger.Warn("container create failed: the engine did not answer", "work_unit_id", wu.ID, "image", cfg.Image, "backend", c.backend, "socket", c.engineSocket, "error", err)
+			return nil, c.engineUnreachable(fmt.Errorf("create container: %w", err))
+		}
 		c.logger.Error("container create failed", "work_unit_id", wu.ID, "image", cfg.Image, "backend", c.backend, "error", err)
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 
 	// Best-effort removal when done.
-	defer func() {
-		rmErr := c.dockerClient.ContainerRemove(context.Background(), containerID)
-		if rmErr != nil {
-			c.logger.Warn("failed to remove container", "container", containerID, "error", rmErr)
-		}
-	}()
+	defer c.removeContainer(containerID)
 
 	// Start container.
 	if err := c.dockerClient.ContainerStart(ctx, containerID); err != nil {
 		c.logger.Error("container start failed", "work_unit_id", wu.ID, "container", containerID, "image", cfg.Image, "backend", c.backend, "error", err)
-		return nil, fmt.Errorf("start container: %w", err)
+		return nil, c.classifyEngineError(fmt.Errorf("start container: %w", err))
 	}
+
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+}
+
+// removeContainer is the best-effort removal every started container of a
+// unit gets when its supervision ends (deferred by Execute and adoptContainer).
+// Skipped only by a quit that suspended the unit, which exits the process
+// without running defers on purpose so the paused container survives.
+func (c *ContainerRuntime) removeContainer(containerID string) {
+	if rmErr := c.dockerClient.ContainerRemove(context.Background(), containerID); rmErr != nil {
+		c.logger.Warn("failed to remove container", "container", containerID, "error", rmErr)
+	}
+}
+
+// adoptContainer supervises a container a previous session left for this unit
+// — paused at quit and unpaused again by ResumeWorkUnitContainer, or still
+// running after a crash — to completion, in place of creating a new one. The
+// work dir was preserved, so the container's binds are still in place. This is
+// the container analogue of the daemon's orphan-PID resume; before it, every
+// resume of a container unit re-ran it from scratch beside the frozen twin
+// (TB-74).
+func (c *ContainerRuntime) adoptContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult) (*ExecutionResult, error) {
+	containerID := prep.OrphanContainerID
+	c.logger.Info("adopting the unit's container from the previous session",
+		"work_unit_id", wu.ID, "leaf_id", wu.LeafID, "container", shortImageID(containerID))
+
+	// Any other container of this unit is a leftover twin (TB-74).
+	if n := c.RemoveWorkUnitContainers(ctx, wu.ID, containerID); n > 0 {
+		c.logger.Info("removed leftover twins of the adopted container", "work_unit_id", wu.ID, "removed", n)
+	}
+	defer c.removeContainer(containerID)
+
+	// The container already holds its GPU device; the selection here only
+	// serves the metrics collector, and finding none is not a failure.
+	var selectedGPU *GpuDetectionResult
+	var gpuDeviceIdx int
+	if wu.ExecutionSpec.GPURequired {
+		selectedGPU, gpuDeviceIdx = c.selectGPU(wu.ExecutionSpec.GPUType)
+	}
+	return c.runContainer(ctx, wu, prep, containerID, selectedGPU, gpuDeviceIdx)
+}
+
+// runContainer supervises a started container of the unit to completion —
+// the deadline, the /work disk watchdog, GPU metrics, the graceful stop on
+// cancellation, log capture, the output read and the metrics — and is shared
+// by Execute (a container it just created) and adoptContainer (one a previous
+// session left running). selectedGPU may be nil.
+func (c *ContainerRuntime) runContainer(ctx context.Context, wu *WorkUnit, prep *PrepareResult, containerID string, selectedGPU *GpuDetectionResult, gpuDeviceIdx int) (*ExecutionResult, error) {
+	outputDir := filepath.Join(prep.WorkDir, "output")
+	checkpointDir := filepath.Join(prep.WorkDir, "checkpoint")
 
 	// Notify caller of container ID for suspend/resume support.
 	if prep.ContainerIDCallback != nil {
@@ -759,7 +960,9 @@ func (c *ContainerRuntime) Execute(ctx context.Context, wu *WorkUnit, prep *Prep
 			}
 			return nil, fmt.Errorf("execution deadline exceeded: %w", waitCtx.Err())
 		}
-		return nil, fmt.Errorf("container wait: %w", err)
+		// An engine that died under a running container drops the wait: an
+		// outage, not the unit's exit (TB-80).
+		return nil, c.classifyEngineError(fmt.Errorf("container wait: %w", err))
 	}
 
 	// Capture logs to execution.log (capped at 10 MB).

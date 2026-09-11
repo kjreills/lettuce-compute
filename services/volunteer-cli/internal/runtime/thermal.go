@@ -123,15 +123,128 @@ type ThermalMonitor struct {
 	gpuCollectors []*GPUMetricsCollector
 	pollOverride  time.Duration    // for testing; 0 = use config
 	nowFn         func() time.Time // for testing; nil = time.Now
+	notices       NoticeSink       // optional; nil discards notices
+	// capability is where the CPU temperature comes from on this machine,
+	// detected once at Start (TB-77). Read through Capability.
+	capability ThermalCapability
 
 	mu      sync.Mutex
 	stopCh  chan struct{}
 	stopped bool
 }
 
+// thermalCPUUnreadableCode is the notice raised once at start when thermal
+// protection is on but this machine's CPU temperature cannot be read, so the
+// CPU pause threshold the volunteer set has no effect (TB-77).
+const thermalCPUUnreadableCode = "thermal_cpu_unreadable"
+
+// Notice levels as the daemon's notice ring spells them (daemon.NoticeInfo,
+// NoticeWarn); duplicated here because this package cannot import daemon.
+const (
+	NoticeLevelInfo = "info"
+	NoticeLevelWarn = "warn"
+)
+
+// NoticeSink receives volunteer-facing notices — the throttle activated /
+// released escalations that the monitor otherwise only logs — and the
+// resolution of the activation notice when the throttle releases. The
+// daemon's notice ring implements it; declared here (not imported) because
+// this package cannot depend on the daemon package that depends on it.
+type NoticeSink interface {
+	Notify(level, code, message, head, leaf string)
+	Resolve(code, head, leaf string) int
+}
+
+// SetNoticeSink routes the monitor's throttle notices to the given sink. Must
+// be called before Start.
+func (t *ThermalMonitor) SetNoticeSink(sink NoticeSink) {
+	t.notices = sink
+}
+
+// notify forwards a notice to the sink, if one is set.
+func (t *ThermalMonitor) notify(level, message string) {
+	if t.notices == nil {
+		return
+	}
+	t.notices.Notify(level, "thermal_throttle", message, "", "")
+}
+
+// resolveThrottleNotice marks the activation notice resolved: the throttle
+// has released, so "computing paused" is no longer true. Called before the
+// release notice is emitted so that notice starts a fresh entry rather than
+// refreshing the warning in place.
+func (t *ThermalMonitor) resolveThrottleNotice() {
+	if t.notices == nil {
+		return
+	}
+	t.notices.Resolve("thermal_throttle", "", "")
+}
+
 // SetClockForTest overrides the monitor's clock (for testing only).
 func (t *ThermalMonitor) SetClockForTest(fn func() time.Time) {
 	t.nowFn = fn
+}
+
+// Capability reports where this machine's CPU temperature comes from, as
+// detected at Start (TB-77). Before Start it is the zero value.
+func (t *ThermalMonitor) Capability() ThermalCapability {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.capability
+}
+
+// announceCPUSource says, once at start, what the CPU threshold check is
+// actually reading (TB-77). Nothing used to distinguish "the CPU is cool"
+// from "I cannot read the CPU": a reading of 0 can never pause work, and no
+// log line, notice, `doctor` row or Settings caption said so, so a tester's
+// Intel MacBook sat at 100 °C under "pause above 85 °C" with the sliders in
+// front of him. The log line is unconditional; the notice is raised only when
+// the CPU cannot be read — as a warning when the volunteer can fix it
+// (install the macOS helper, load a Linux driver) and as information when
+// nothing they do will change it (Windows), so a box labelled "needs
+// attention" never holds what no one can act on.
+func (t *ThermalMonitor) announceCPUSource() (enabled bool) {
+	cap := ThermalCapabilityReader()
+	t.mu.Lock()
+	t.capability = cap
+	t.mu.Unlock()
+
+	if !t.config.Enabled {
+		t.logger.Info("thermal protection off (thermal.enabled false)", "cpu_source", cap.CPUSource)
+		return false
+	}
+	if cap.CPUReadable {
+		t.logger.Info("thermal protection active",
+			"cpu_source", cap.CPUSource,
+			"detail", cap.Detail,
+			"cpu_pause_above", t.config.CPUPauseThresholdC,
+			"cpu_resume_below", t.config.CPUResumeThresholdC,
+			"gpu_pause_above", t.config.GPUPauseThresholdC,
+			"gpu_resume_below", t.config.GPUResumeThresholdC,
+		)
+		return true
+	}
+
+	t.logger.Warn("thermal protection cannot read this machine's CPU temperature; the CPU pause threshold has no effect (GPU thresholds and hardware protection are unaffected)",
+		"cpu_source", cap.CPUSource,
+		"detail", cap.Detail,
+		"remedy", cap.Remedy,
+		"cpu_pause_above", t.config.CPUPauseThresholdC,
+	)
+	if t.notices == nil {
+		return true
+	}
+	level := NoticeLevelInfo
+	if cap.Fixable() {
+		level = NoticeLevelWarn
+	}
+	msg := fmt.Sprintf("Thermal protection cannot read this machine's CPU temperature (%s), so the CPU pause threshold of %d°C has no effect. GPU thresholds still apply where a GPU tool reports a temperature, and the hardware's own thermal protection is unaffected.",
+		cap.Detail, t.config.CPUPauseThresholdC)
+	if cap.Fixable() {
+		msg += " To enable it, " + cap.Remedy + "."
+	}
+	t.notices.Notify(level, thermalCPUUnreadableCode, msg, "", "")
+	return true
 }
 
 // NewThermalMonitor creates a new thermal monitor.
@@ -156,9 +269,12 @@ func (t *ThermalMonitor) SetPollIntervalForTest(d time.Duration) {
 	t.pollOverride = d
 }
 
-// Start begins temperature monitoring in a goroutine.
+// Start begins temperature monitoring in a goroutine. The CPU temperature
+// source is detected and reported first (TB-77), whether or not protection
+// is on, so `doctor`, the management API and the app can say what this
+// machine can read either way.
 func (t *ThermalMonitor) Start(ctx context.Context) {
-	if !t.config.Enabled {
+	if !t.announceCPUSource() {
 		return
 	}
 
@@ -225,6 +341,9 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 						"gpu_threshold", t.config.GPUPauseThresholdC,
 						"sensors", describeSensors(critPausing),
 					)
+					t.notify("warn", fmt.Sprintf("Computing paused: thermal throttle activated (cause: %s; CPU %d°C, pause threshold %d°C; GPU %d°C, pause threshold %d°C%s). Work resumes when temperatures fall below the resume thresholds.",
+						throttleCause(cpuHot, gpuHot, critPausing), cpuTemp, t.config.CPUPauseThresholdC, gpuTemp, t.config.GPUPauseThresholdC,
+						sensorSuffix(critPausing)))
 					t.signal(ctx, true)
 				}
 				continue
@@ -235,11 +354,15 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 
 			if cpuOK && gpuOK && len(critStillHot) == 0 {
 				throttled = false
+				pausedFor := t.now().Sub(throttledSince).Round(time.Second).String()
 				t.logger.Info("thermal throttle released",
 					"cpu_temp", cpuTemp,
 					"gpu_temp", gpuTemp,
-					"paused_for", t.now().Sub(throttledSince).Round(time.Second).String(),
+					"paused_for", pausedFor,
 				)
+				t.resolveThrottleNotice()
+				t.notify("info", fmt.Sprintf("Thermal throttle released after %s (CPU %d°C, GPU %d°C); computing resumed.",
+					pausedFor, cpuTemp, gpuTemp))
 				t.signal(ctx, false)
 				continue
 			}
@@ -279,6 +402,9 @@ func (t *ThermalMonitor) run(ctx context.Context, interval time.Duration) {
 					"suppressed_for", suppressionCooldown.String(),
 					"note", "the CPU and GPU are within their thresholds; this reading is not clearing while work is suspended, so suspending is not helping it. Resuming, and ignoring these sensors for the cooldown. Hardware thermal protection is unaffected.",
 				)
+				t.resolveThrottleNotice()
+				t.notify("warn", fmt.Sprintf("Thermal throttle force-released after %s: the CPU (%d°C) and GPU (%d°C) are within their thresholds, but %s stayed past its own critical point and suspending work was not helping it. Computing resumed; those sensors are ignored for %s. Hardware thermal protection is unaffected.",
+					held.Round(time.Second).String(), cpuTemp, gpuTemp, describeSensors(critStillHot), suppressionCooldown.String()))
 				t.signal(ctx, false)
 				continue
 			}
@@ -332,6 +458,15 @@ func throttleCause(cpuHot, gpuHot bool, crit []Sensor) string {
 		return "unknown"
 	}
 	return strings.Join(causes, "+")
+}
+
+// sensorSuffix renders sensors for a notice sentence — "; sensors: ..." — or
+// nothing when there are none, so the sentence reads cleanly either way.
+func sensorSuffix(sensors []Sensor) string {
+	if len(sensors) == 0 {
+		return ""
+	}
+	return "; sensors: " + describeSensors(sensors)
 }
 
 // describeSensors renders sensors for a log line: "thermal_zone2(nvme) 96C/95C".

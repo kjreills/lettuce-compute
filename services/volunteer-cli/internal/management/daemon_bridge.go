@@ -1,7 +1,6 @@
 package management
 
 import (
-	"bufio"
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
@@ -69,6 +68,17 @@ func (b *DaemonBridge) resolveLeafName(leafID string) string {
 	return leafID
 }
 
+// historyLeafName is the display name for a history entry: the name the daemon
+// recorded at completion (TB-46), else the live cache's answer for the id, else
+// the id itself. Entries written before names were recorded, or whose leaf has
+// since left the cache, are why both fallbacks remain.
+func (b *DaemonBridge) historyLeafName(e daemon.HistoryEntry) string {
+	if e.LeafName != "" {
+		return e.LeafName
+	}
+	return b.resolveLeafName(e.LeafID)
+}
+
 // StatusResponse is the response for GET /api/v1/status.
 type StatusResponse struct {
 	State            string           `json:"state"`
@@ -77,6 +87,14 @@ type StatusResponse struct {
 	ActiveTasks      []ActiveTaskInfo `json:"active_tasks"`
 	QueuedTasks      []QueuedTaskInfo `json:"queued_tasks"`
 	PausedReason     *string          `json:"paused_reason"`
+	// PausedDetail is one sentence behind PausedReason when the reason has
+	// one — for "busy", the share of the CPU other programs are using and
+	// the two thresholds (TB-83). Absent otherwise.
+	PausedDetail string `json:"paused_detail,omitempty"`
+	// ClientVersion is this volunteer build's version string (what
+	// `lettuce-volunteer --version` prints), so a client can compare it with
+	// each head's head_version on GET /api/v1/heads.
+	ClientVersion string `json:"client_version"`
 	// FailingLeafs lists every leaf whose units have failed locally since the
 	// daemon started, newest failure first. It exists so a volunteer can see that
 	// work IS arriving and failing, rather than concluding they are never sent
@@ -145,6 +163,10 @@ func computeTaskStatus(task daemon.CurrentTask, pauseReason string, daemonPaused
 		case "scheduled":
 			status = "suspended_scheduled"
 			r := "Outside scheduled computing hours"
+			return status, &r
+		case "busy":
+			status = "suspended_busy"
+			r := "Other programs are using the CPU"
 			return status, &r
 		case "user":
 			status = "suspended_user"
@@ -263,6 +285,7 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 	if pauseReason != "" {
 		pausedReasonPtr = &pauseReason
 	}
+	pausedDetail := b.daemon.PauseDetail()
 
 	var queuedTasks []QueuedTaskInfo
 	for _, qt := range b.daemon.GetQueuedTasks() {
@@ -284,9 +307,28 @@ func (b *DaemonBridge) GetStatus() StatusResponse {
 		ConnectedServers: connectedServers,
 		ActiveTasks:      activeTasks,
 		QueuedTasks:      queuedTasks,
+		PausedDetail:     pausedDetail,
 		PausedReason:     pausedReasonPtr,
 		FailingLeafs:     b.failingLeafs(),
+		ClientVersion:    b.daemon.ClientVersion(),
 	}
+}
+
+// NoticesResponse is the response for GET /api/v1/notices.
+type NoticesResponse struct {
+	// Notices is most recently updated first.
+	Notices []daemon.Notice `json:"notices"`
+	// LatestID is the highest notice id ever assigned by this daemon run (0
+	// when none). A client polls with ?since=<latest_id> to receive only
+	// notices created after its last poll.
+	LatestID uint64 `json:"latest_id"`
+}
+
+// GetNotices returns the volunteer-facing notices created after since (all of
+// them when since is 0).
+func (b *DaemonBridge) GetNotices(since uint64) NoticesResponse {
+	notices, latest := b.daemon.Notices().Since(since)
+	return NoticesResponse{Notices: notices, LatestID: latest}
 }
 
 // failingLeafs renders the daemon's per-leaf failure records for the API,
@@ -444,6 +486,66 @@ type AttachRequest struct {
 	ServerAddress string `json:"server_address"`
 	LeafID        string `json:"leaf_id,omitempty"`
 	Name          string `json:"name,omitempty"`
+	// TrustedRuntimes is the runtime trust to record for the new head: which
+	// runtime kinds beyond WASM ("CONTAINER", "NATIVE"; case-insensitive) its
+	// operator may run on this machine. Absent or empty means WASM only — the
+	// safe default when the client offered no consent step. See
+	// parseTrustedRuntimes for validation.
+	TrustedRuntimes []string `json:"trusted_runtimes,omitempty"`
+}
+
+// parseTrustedRuntimes validates and normalises a trusted_runtimes list from
+// an API request into the stored form: UPPERCASE, de-duplicated, sorted, and
+// never nil — an explicit empty list is the recorded "WASM only" decision
+// (PB-28), and a nil would be re-pinned by the load-time migration as a
+// legacy blank. Only CONTAINER and NATIVE are accepted: WASM is always
+// trusted and is never stored, so listing it is a caller error rather than a
+// no-op, and any other token is rejected so a typo cannot silently narrow or
+// widen trust. Mirrors the CLI's `heads trust` semantics: the list REPLACES
+// the head's trust rather than merging into it.
+func parseTrustedRuntimes(raw []string) ([]string, error) {
+	seen := make(map[string]bool, len(raw))
+	out := []string{}
+	for _, r := range raw {
+		u := strings.ToUpper(strings.TrimSpace(r))
+		switch u {
+		case "CONTAINER", "NATIVE":
+			if !seen[u] {
+				seen[u] = true
+				out = append(out, u)
+			}
+		default:
+			return nil, fmt.Errorf("trusted_runtimes: unknown runtime %q (valid: CONTAINER, NATIVE; WASM is always allowed and is not listed)", strings.TrimSpace(r))
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// trustedRuntimesEqual reports whether two trust lists grant the same
+// runtimes, ignoring case, order and duplicates — so a PUT that re-sends the
+// current trust is not reported as a change needing a restart.
+func trustedRuntimesEqual(a, b []string) bool {
+	set := func(list []string) map[string]bool {
+		m := make(map[string]bool, len(list))
+		for _, r := range list {
+			u := strings.ToUpper(strings.TrimSpace(r))
+			if u != "" && u != "WASM" {
+				m[u] = true
+			}
+		}
+		return m
+	}
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for r := range sa {
+		if !sb[r] {
+			return false
+		}
+	}
+	return true
 }
 
 // loadWriteBase returns the config a bridge write-back must start from: the
@@ -481,6 +583,21 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	if req.ServerAddress == "" {
 		return fmt.Errorf("server_address is required")
 	}
+	// Validate before taking the lock or touching disk: a bad trust list must
+	// leave the config untouched.
+	trusted, err := parseTrustedRuntimes(req.TrustedRuntimes)
+	if err != nil {
+		return err
+	}
+	// The desktop app hands over whatever the volunteer typed into its address
+	// field — possibly "https://host/" (its own Test Connection accepts that).
+	// Derive the gRPC target, the HTTP base and the default name from the
+	// parsed address, as `init` and `attach` do, instead of storing the raw
+	// string as a gRPC target that can never resolve (TB-51).
+	addr, err := config.ParseHeadAddress(req.ServerAddress)
+	if err != nil {
+		return err
+	}
 
 	b.cfgMu.Lock()
 	defer b.cfgMu.Unlock()
@@ -493,24 +610,27 @@ func (b *DaemonBridge) AttachLeaf(req AttachRequest) error {
 	}
 
 	// Check for duplicates.
+	grpcAddr := addr.GRPCAddress()
 	for _, s := range newCfg.Servers {
-		if s.GRPCAddress == req.ServerAddress {
-			return fmt.Errorf("already attached to %s", req.ServerAddress)
+		if s.GRPCAddress == grpcAddr {
+			return fmt.Errorf("already attached to %s", grpcAddr)
 		}
 	}
 
 	name := req.Name
 	if name == "" {
-		name = req.ServerAddress
+		name = addr.Host
 	}
 
 	sc := config.ServerConfig{
-		GRPCAddress: req.ServerAddress,
+		GRPCAddress: grpcAddr,
+		HTTPAddress: addr.HTTPAddress(),
 		Name:        name,
-		// Explicit empty, not nil: attaching through the bridge has no consent
-		// step, so the new head starts WASM-only as a recorded decision, not a
-		// legacy blank (PB-28).
-		TrustedRuntimes: []string{},
+		Insecure:    addr.Insecure,
+		// Exactly what the request granted — the client's consent step, if it
+		// had one — and an explicit empty list otherwise, so the new head starts
+		// WASM-only as a recorded decision, not a legacy blank (PB-28).
+		TrustedRuntimes: trusted,
 	}
 	if req.LeafID != "" {
 		sc.PinnedLeafIDs = []string{req.LeafID}
@@ -626,7 +746,14 @@ func containsIgnoreCase(s, substr string) bool {
 // HistoryResponse is the response for GET /api/v1/history.
 type HistoryResponse struct {
 	Entries    []HistoryEntryInfo `json:"entries"`
-	Pagination PaginationInfo    `json:"pagination"`
+	Pagination PaginationInfo     `json:"pagination"`
+	// LeafNames is every distinct leaf display name in the WHOLE history file,
+	// sorted, regardless of the page, cursor or filters this request asked for.
+	// The desktop app's leaf filter is built from it: built from the pages
+	// loaded so far, a leaf whose last unit was older than the newest page
+	// could not be selected until the reader had scrolled one of its rows into
+	// view (TB-71). The file is read in full for the page anyway.
+	LeafNames []string `json:"leaf_names"`
 }
 
 // HistoryEntryInfo describes a completed work unit.
@@ -658,6 +785,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 
 	cfg := b.daemon.GetConfig()
 	entries := readAllHistory(cfg.DataDir)
+	leafNames := b.historyLeafNames(entries)
 
 	// Apply filters.
 	var filtered []daemon.HistoryEntry
@@ -694,6 +822,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 		return HistoryResponse{
 			Entries:    []HistoryEntryInfo{},
 			Pagination: PaginationInfo{},
+			LeafNames:  leafNames,
 		}
 	}
 
@@ -712,7 +841,7 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 		}
 		result[i] = HistoryEntryInfo{
 			WorkUnitID:       e.WorkUnitID,
-			LeafName:         b.resolveLeafName(e.LeafID),
+			LeafName:         b.historyLeafName(e),
 			CompletedAt:      e.CompletedAt.Format(time.RFC3339),
 			DurationSeconds:  e.WallClockSeconds,
 			CPUSeconds:       e.CPUSeconds,
@@ -733,51 +862,52 @@ func (b *DaemonBridge) GetHistory(cursor string, limit int, leafID, from, to str
 			NextCursor: nextCursor,
 			HasMore:    hasMore,
 		},
+		LeafNames: leafNames,
 	}
 }
 
-// readAllHistory reads all history entries (newest first).
+// historyLeafNames is the sorted set of display names the given entries would
+// be served under — the same name per entry as historyLeafName, so the filter
+// built from the list matches the rows it is applied to.
+func (b *DaemonBridge) historyLeafNames(entries []daemon.HistoryEntry) []string {
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, e := range entries {
+		name := b.historyLeafName(e)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// readAllHistory reads all history entries (newest first). A file that cannot be
+// read is an empty history here: the surfaces built on it are secondary.
 func readAllHistory(dataDir string) []daemon.HistoryEntry {
-	path := daemon.HistoryFilePath(dataDir)
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var entries []daemon.HistoryEntry
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var e daemon.HistoryEntry
-		if err := json.Unmarshal([]byte(line), &e); err != nil {
-			continue
-		}
-		entries = append(entries, e)
-	}
-
-	// Reverse for newest first.
-	for i, j := 0, len(entries)-1; i < j; i, j = i+1, j-1 {
-		entries[i], entries[j] = entries[j], entries[i]
-	}
+	entries, _ := daemon.ReadAllHistory(dataDir)
 	return entries
 }
 
 // ConfigResponse is the response for GET /api/v1/config.
 type ConfigResponse struct {
-	DataDir           string                    `json:"data_dir"`
-	PublicKey         string                    `json:"public_key,omitempty"`
-	ResourceLimits    config.ResourceLimits     `json:"resource_limits"`
-	Scheduling        config.Scheduling         `json:"scheduling"`
-	Leafs             config.LeafFilter `json:"leafs"`
-	Thermal           config.ThermalConfig      `json:"thermal"`
-	Notifications     config.NotificationConfig `json:"notifications"`
-	Servers           []config.ServerConfig     `json:"servers"`
-	LogLevel          string                    `json:"log_level"`
-	MaxConcurrent     int                       `json:"max_concurrent_tasks"`
+	DataDir        string                    `json:"data_dir"`
+	PublicKey      string                    `json:"public_key,omitempty"`
+	ResourceLimits config.ResourceLimits     `json:"resource_limits"`
+	Scheduling     config.Scheduling         `json:"scheduling"`
+	Leafs          config.LeafFilter         `json:"leafs"`
+	Thermal        config.ThermalConfig      `json:"thermal"`
+	Yield          config.YieldConfig        `json:"yield"`
+	Notifications  config.NotificationConfig `json:"notifications"`
+	Servers        []config.ServerConfig     `json:"servers"`
+	LogLevel       string                    `json:"log_level"`
+	MaxConcurrent  int                       `json:"max_concurrent_tasks"`
+	// WorkBufferHours is how many hours of work the daemon keeps buffered per
+	// execution slot (0 = a small unit-count fallback). PUT already accepted it;
+	// it is returned here so a client can show the current value it writes.
+	WorkBufferHours float64 `json:"work_buffer_hours"`
 }
 
 // GetConfig returns the current configuration (with sensitive paths redacted).
@@ -790,21 +920,36 @@ func (b *DaemonBridge) GetConfig() ConfigResponse {
 	}
 
 	return ConfigResponse{
-		DataDir:           cfg.DataDir,
-		PublicKey:          pubKeyStr,
-		ResourceLimits:    cfg.ResourceLimits,
-		Scheduling:        cfg.Scheduling,
-		Leafs:             cfg.Leafs,
-		Thermal:           cfg.Thermal,
-		Notifications:     cfg.Notifications,
-		Servers:           cfg.Servers,
-		LogLevel:          cfg.LogLevel,
-		MaxConcurrent:     cfg.MaxConcurrentTasks,
+		DataDir:         cfg.DataDir,
+		PublicKey:       pubKeyStr,
+		ResourceLimits:  cfg.ResourceLimits,
+		Scheduling:      cfg.Scheduling,
+		Leafs:           cfg.Leafs,
+		Thermal:         cfg.Thermal,
+		Yield:           cfg.Yield,
+		Notifications:   cfg.Notifications,
+		Servers:         cfg.Servers,
+		LogLevel:        cfg.LogLevel,
+		MaxConcurrent:   cfg.MaxConcurrentTasks,
+		WorkBufferHours: cfg.WorkBufferHours,
 	}
 }
 
+// UpdateConfigResponse is the response for PUT /api/v1/config: the resulting
+// configuration plus whether the daemon must be restarted for part of the
+// change to take effect.
+type UpdateConfigResponse struct {
+	ConfigResponse
+	// RestartRequired is true when a setting that is only read at start-up
+	// changed: a head's trusted_runtimes (applied when the daemon builds its
+	// runtime registry and advertises runtimes to each head), or
+	// max_concurrent_tasks (the slot count). Such a change is on disk but not
+	// yet in force — exactly what `heads trust` tells the user after saving.
+	RestartRequired bool `json:"restart_required"`
+}
+
 // UpdateConfig applies a partial config update, validates, persists, and applies.
-func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, error) {
+func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*UpdateConfigResponse, error) {
 	b.cfgMu.Lock()
 	defer b.cfgMu.Unlock()
 
@@ -831,6 +976,11 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 			applyThermal(&newCfg.Thermal, th)
 		}
 	}
+	if v, ok := partial["yield"]; ok {
+		if y, ok := v.(map[string]any); ok {
+			applyYield(&newCfg.Yield, y)
+		}
+	}
 	if v, ok := partial["notifications"]; ok {
 		if n, ok := v.(map[string]any); ok {
 			applyNotifications(&newCfg.Notifications, n)
@@ -841,8 +991,14 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 			newCfg.LogLevel = s
 		}
 	}
+	// The slot count is fixed when the daemon starts, so a change here is on
+	// disk but not in force until restart (ApplyConfig logs the same).
+	maxConcurrentChanged := false
 	if v, ok := partial["max_concurrent_tasks"]; ok {
-		newCfg.MaxConcurrentTasks = toInt(v)
+		if n := toInt(v); n != newCfg.MaxConcurrentTasks {
+			newCfg.MaxConcurrentTasks = n
+			maxConcurrentChanged = true
+		}
 	}
 	if v, ok := partial["leafs"]; ok {
 		if p, ok := v.(map[string]any); ok {
@@ -852,9 +1008,14 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 	if v, ok := partial["work_buffer_hours"]; ok {
 		newCfg.WorkBufferHours = toFloat(v)
 	}
+	trustChanged := false
 	if v, ok := partial["servers"]; ok {
 		if serverList, ok := v.([]any); ok {
-			applyServers(newCfg, serverList)
+			changed, err := applyServers(newCfg, serverList)
+			if err != nil {
+				return nil, err
+			}
+			trustChanged = changed
 		}
 	}
 
@@ -868,20 +1029,29 @@ func (b *DaemonBridge) UpdateConfig(partial map[string]any) (*ConfigResponse, er
 
 	b.daemon.ApplyConfig(newCfg)
 
-	resp := b.GetConfig()
-	return &resp, nil
+	return &UpdateConfigResponse{
+		ConfigResponse:  b.GetConfig(),
+		RestartRequired: trustChanged || maxConcurrentChanged,
+	}, nil
 }
 
 // HeadInfo describes a connected head (server) with its leaf info.
 type HeadInfo struct {
-	Name        string       `json:"name"`
-	Description string       `json:"description,omitempty"`
-	URL         string       `json:"url,omitempty"`
-	GRPCAddress string       `json:"grpc_address"`
-	Status      string       `json:"status"` // "connected", "disconnected"
-	Weight      int          `json:"weight"`
-	VolunteerID string       `json:"volunteer_id,omitempty"`
-	Leafs       []LeafDetail `json:"leafs"`
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	URL         string `json:"url,omitempty"`
+	GRPCAddress string `json:"grpc_address"`
+	Status      string `json:"status"` // "connected", "disconnected"
+	Weight      int    `json:"weight"`
+	VolunteerID string `json:"volunteer_id,omitempty"`
+	// HeadVersion is the head's build version as it reported it at start-up
+	// (empty when unknown). UpdateRequired is true once this head has
+	// rejected this volunteer build as too old — at registration or on a
+	// work request — and stays true until a later request to the head
+	// succeeds; the remedy is `lettuce-volunteer update`.
+	HeadVersion    string       `json:"head_version"`
+	UpdateRequired bool         `json:"update_required"`
+	Leafs          []LeafDetail `json:"leafs"`
 	// LeafsRefreshedAt is when this head's leaf figures below were last fetched.
 	// The daemon refreshes the leaf cache only inside the fetch path, so their age
 	// is unbounded: a host with a full buffer, or one slot held by a long unit,
@@ -970,15 +1140,32 @@ type MachineCapabilities struct {
 	// registry, lowercase (e.g. ["container","native","wasm"]).
 	Runtimes []string `json:"runtimes"`
 	HasGPU   bool     `json:"has_gpu"`
-	// MaxMemoryMB is the per-unit memory ceiling the daemon is enforcing.
+	// MaxMemoryMB is the memory budget the daemon advertises to heads and
+	// enforces: the configured limit, clipped to what the container engine's
+	// VM can hold where there is one (TB-63).
 	MaxMemoryMB int `json:"max_memory_mb"`
+	// ContainerVMMemoryMB is the memory of the virtual machine the container
+	// engine runs inside (macOS/Windows: a Podman machine, Docker Desktop's
+	// engine VM), 0 when the engine shares the host's RAM or no container
+	// runtime is registered. MemoryLimitedByVM says that VM, not the
+	// configured limit, is what bounds MaxMemoryMB — so a client can name the
+	// machine as the thing to enlarge rather than offer to raise a limit that
+	// would change nothing (TB-63).
+	ContainerVMMemoryMB int  `json:"container_vm_memory_mb"`
+	MemoryLimitedByVM   bool `json:"memory_limited_by_vm"`
 	// MaxDiskMB and MaxCPUCores are the other two budgets the head matches leafs
 	// against, in the same units it receives them (max_disk_gb is advertised as
 	// MB). Reported here so the client checks a leaf against what this daemon
 	// actually advertised, not against a config file that may have moved on
-	// since (TB-15).
-	MaxDiskMB   int64 `json:"max_disk_mb"`
-	MaxCPUCores int   `json:"max_cpu_cores"`
+	// since (TB-15). MaxCPUCores is the whole-machine CPU budget every running
+	// task shares — the configured limit, clipped to the container engine
+	// VM's vCPUs where there is one (TB-75); ContainerVMCPUs and
+	// CPULimitedByVM are that VM's count and whether it is the bound, as
+	// ContainerVMMemoryMB / MemoryLimitedByVM are for memory.
+	MaxDiskMB       int64 `json:"max_disk_mb"`
+	MaxCPUCores     int   `json:"max_cpu_cores"`
+	ContainerVMCPUs int   `json:"container_vm_cpus"`
+	CPULimitedByVM  bool  `json:"cpu_limited_by_vm"`
 	// The GPU side of the same idea (TB-21). MaxGPUVRAMMB is the ALLOWED VRAM —
 	// card capacity * max_gpu_vram_pct / 100, the figure dispatch compares a leaf
 	// against — not the size of the card. GPUVendors are uppercase ("NVIDIA").
@@ -990,6 +1177,21 @@ type MachineCapabilities struct {
 	GPUVRAMPct             int      `json:"gpu_vram_pct"`
 	GPUVendors             []string `json:"gpu_vendors"`
 	GPUComputeCapabilities []string `json:"gpu_compute_capabilities"`
+	// Where the thermal monitor's CPU temperature comes from (TB-77):
+	// CPUTempSource is "sysfs", "osx-cpu-temp" or "none"; CPUTempReadable
+	// false means the CPU thresholds have no effect on this machine, and
+	// CPUTempDetail says why in a sentence. CPUTempRemedy is what the
+	// volunteer can do about it, or "" when nothing.
+	CPUTempSource   string `json:"cpu_temp_source"`
+	CPUTempReadable bool   `json:"cpu_temp_readable"`
+	CPUTempDetail   string `json:"cpu_temp_detail"`
+	CPUTempRemedy   string `json:"cpu_temp_remedy,omitempty"`
+	// Whether the yield monitor can measure other programs' CPU use here
+	// (TB-83). Reported as true while the monitor is off (nothing has tried);
+	// false only once sampling has actually failed, with YieldUnavailable
+	// saying why.
+	YieldMeasurable  bool   `json:"yield_measurable"`
+	YieldUnavailable string `json:"yield_unavailable,omitempty"`
 }
 
 // MachineRuntimes returns the runtime kinds this daemon has registered and can
@@ -1004,20 +1206,32 @@ func (b *DaemonBridge) MachineRuntimes() []string {
 func (b *DaemonBridge) MachineCaps() MachineCapabilities {
 	rl := b.daemon.GetConfig().ResourceLimits
 	vramMB, cardVRAMMB, vramPct, vendors, computeCaps := b.daemon.GPUBudget()
+	thermal := b.daemon.ThermalCapability()
+	yield := b.daemon.YieldSnapshot()
 	return MachineCapabilities{
-		Runtimes:    b.MachineRuntimes(),
-		HasGPU:      b.daemon.HasGPU(),
-		MaxMemoryMB: rl.MaxMemoryMB,
+		Runtimes:            b.MachineRuntimes(),
+		HasGPU:              b.daemon.HasGPU(),
+		MaxMemoryMB:         b.daemon.MemoryBudgetMB(),
+		ContainerVMMemoryMB: b.daemon.ContainerVMMemoryMB(),
+		MemoryLimitedByVM:   b.daemon.MemoryLimitedByVM(),
 		// max_disk_gb is advertised to the head in MB (client/hardware.go), so it
 		// is converted here rather than at the comparison, where a GB-vs-MB slip
 		// would silently pass every leaf.
 		MaxDiskMB:              int64(rl.MaxDiskGB) * 1024,
-		MaxCPUCores:            rl.MaxCPUCores,
+		MaxCPUCores:            b.daemon.CPUBudgetCores(),
+		ContainerVMCPUs:        b.daemon.ContainerVMCPUs(),
+		CPULimitedByVM:         b.daemon.CPULimitedByVM(),
 		MaxGPUVRAMMB:           vramMB,
 		GPUCardVRAMMB:          cardVRAMMB,
 		GPUVRAMPct:             vramPct,
 		GPUVendors:             vendors,
 		GPUComputeCapabilities: computeCaps,
+		CPUTempSource:          thermal.CPUSource,
+		CPUTempReadable:        thermal.CPUReadable,
+		CPUTempDetail:          thermal.Detail,
+		CPUTempRemedy:          thermal.Remedy,
+		YieldMeasurable:        !yield.Enabled || yield.Measurable,
+		YieldUnavailable:       yield.Unavailable,
 	}
 }
 
@@ -1057,11 +1271,14 @@ func (b *DaemonBridge) GetHeads() []HeadInfo {
 			w = 100
 		}
 
+		hs := b.daemon.HeadStatus().Get(srv.GRPCAddress)
 		hi := HeadInfo{
-			GRPCAddress:  srv.GRPCAddress,
-			Status:       connStatus,
-			Weight:       w,
-			VolunteerID:  serverVolunteerID[name],
+			GRPCAddress:    srv.GRPCAddress,
+			Status:         connStatus,
+			Weight:         w,
+			VolunteerID:    serverVolunteerID[name],
+			HeadVersion:    hs.HeadVersion,
+			UpdateRequired: hs.UpdateRequired,
 		}
 
 		// Fill from cache if available.
@@ -1191,7 +1408,20 @@ type CreditSummary struct {
 	// or "local" when the summary was derived from the local history.jsonl proxy
 	// (no head reachable, or every head predates the GetMyContribution RPC).
 	Source string `json:"source"`
+	// DayBoundary names the calendar rule behind Today/ThisWeek/ThisMonth, so a
+	// client can label them instead of leaving the reader to guess (TB-57).
+	// "utc": the buckets came from the head's daily timeline, which the head
+	// records by UTC date, so they cannot be re-cut to this machine's day. "local":
+	// the buckets were cut from the local history file by this machine's clock,
+	// the same rule the desktop app's history list groups by.
+	DayBoundary string `json:"day_boundary"`
 }
+
+// Values of CreditSummary.DayBoundary.
+const (
+	DayBoundaryUTC   = "utc"
+	DayBoundaryLocal = "local"
+)
 
 // LeafCredit holds credit for a single leaf.
 type LeafCredit struct {
@@ -1234,7 +1464,7 @@ func (b *DaemonBridge) creditFromHeads() (CreditSummary, bool) {
 	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
 	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
 
-	summary := CreditSummary{Source: "head", ByLeaf: []LeafCredit{}, ByHead: []HeadCredit{}}
+	summary := CreditSummary{Source: "head", DayBoundary: DayBoundaryUTC, ByLeaf: []LeafCredit{}, ByHead: []HeadCredit{}}
 	leafByID := make(map[string]*LeafCredit)
 	var leafOrder []string
 	anyAnswered := false
@@ -1315,49 +1545,78 @@ func (b *DaemonBridge) creditFromHistory() CreditSummary {
 	cfg := b.daemon.GetConfig()
 	entries := readAllHistory(cfg.DataDir)
 
-	now := time.Now().UTC()
-	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
-	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	buckets := bucketAcceptedHistory(entries, time.Now())
 
-	var total, today, week, month float64
-	byLeaf := make(map[string]float64)
-
-	for _, e := range entries {
-		if !e.ResultAccepted {
-			continue
-		}
-		total++
-		if e.CompletedAt.After(todayStart) {
-			today++
-		}
-		if e.CompletedAt.After(weekStart) {
-			week++
-		}
-		if e.CompletedAt.After(monthStart) {
-			month++
-		}
-		byLeaf[e.LeafID]++
-	}
-
-	leafCredits := make([]LeafCredit, 0, len(byLeaf))
-	for pid, credit := range byLeaf {
+	leafCredits := make([]LeafCredit, 0, len(buckets.byLeaf))
+	for _, lid := range buckets.leafOrder {
 		leafCredits = append(leafCredits, LeafCredit{
-			LeafID:   pid,
-			LeafName: b.resolveLeafName(pid),
-			Credit:   credit,
+			LeafID:   lid,
+			LeafName: b.historyLeafName(buckets.leafSample[lid]),
+			Credit:   buckets.byLeaf[lid],
 		})
 	}
 
 	return CreditSummary{
-		TotalCredit: total,
-		Today:       today,
-		ThisWeek:    week,
-		ThisMonth:   month,
+		TotalCredit: buckets.total,
+		Today:       buckets.today,
+		ThisWeek:    buckets.week,
+		ThisMonth:   buckets.month,
 		ByLeaf:      leafCredits,
 		ByHead:      []HeadCredit{},
 		Source:      "local",
+		DayBoundary: DayBoundaryLocal,
 	}
+}
+
+// historyBuckets is bucketAcceptedHistory's tally of accepted history entries.
+type historyBuckets struct {
+	total, today, week, month float64
+	byLeaf                    map[string]float64
+	leafOrder                 []string                       // leaf ids in first-seen order, for a stable response
+	leafSample                map[string]daemon.HistoryEntry // one entry per leaf, for its recorded name
+}
+
+// bucketAcceptedHistory tallies the accepted entries into all-time, today,
+// this-week and this-month counts, cutting the day boundaries in the location
+// of now.
+//
+// The daemon and the desktop app run on the same machine, so time.Now() here is
+// the same clock and zone the app's history list groups by, and "today" means
+// the same day on both surfaces (TB-57). Cutting these buckets by UTC day, as the
+// head's timeline must, made a volunteer east of Greenwich see units completed
+// after local midnight listed under Today and yet not counted in it. The week
+// starts on Sunday, matching the head-derived buckets.
+func bucketAcceptedHistory(entries []daemon.HistoryEntry, now time.Time) historyBuckets {
+	loc := now.Location()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
+	weekStart := todayStart.AddDate(0, 0, -int(now.Weekday()))
+	monthStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, loc)
+
+	b := historyBuckets{
+		byLeaf:     make(map[string]float64),
+		leafSample: make(map[string]daemon.HistoryEntry),
+	}
+	for _, e := range entries {
+		if !e.ResultAccepted {
+			continue
+		}
+		b.total++
+		if !e.CompletedAt.Before(todayStart) {
+			b.today++
+		}
+		if !e.CompletedAt.Before(weekStart) {
+			b.week++
+		}
+		if !e.CompletedAt.Before(monthStart) {
+			b.month++
+		}
+		if _, seen := b.byLeaf[e.LeafID]; !seen {
+			b.leafOrder = append(b.leafOrder, e.LeafID)
+			b.leafSample[e.LeafID] = e
+		}
+		b.byLeaf[e.LeafID]++
+	}
+	return b
 }
 
 // TaskDetail is the response for GET /api/v1/tasks/{work_unit_id}/details.
@@ -1542,6 +1801,26 @@ func applyThermal(t *config.ThermalConfig, m map[string]any) {
 	}
 }
 
+func applyYield(y *config.YieldConfig, m map[string]any) {
+	if v, ok := m["enabled"]; ok {
+		if b, ok := v.(bool); ok {
+			y.Enabled = b
+		}
+	}
+	if v, ok := m["cpu_pause_pct"]; ok {
+		y.CPUPausePct = toInt(v)
+	}
+	if v, ok := m["cpu_resume_pct"]; ok {
+		y.CPUResumePct = toInt(v)
+	}
+	if v, ok := m["window_seconds"]; ok {
+		y.WindowSeconds = toInt(v)
+	}
+	if v, ok := m["poll_interval_seconds"]; ok {
+		y.PollIntervalSeconds = toInt(v)
+	}
+}
+
 func applyLeafFilter(p *config.LeafFilter, m map[string]any) {
 	if v, ok := m["mode"]; ok {
 		if str, ok := v.(string); ok {
@@ -1586,9 +1865,16 @@ func applyNotifications(n *config.NotificationConfig, m map[string]any) {
 	}
 }
 
-// applyServers merges incoming server updates into the config.
-// Matches by server name; only updates weight and leaf_preferences.
-func applyServers(cfg *config.Config, serverList []any) {
+// applyServers merges incoming server updates into the config. Entries are
+// matched by server name; weight, leaf_preferences and trusted_runtimes are
+// updated when present and left untouched when absent — so a PUT that does
+// not mention trust can never revert an on-disk `heads trust <head> none`
+// (PB-28). trusted_runtimes, when present, REPLACES the head's trust with
+// exactly the validated list (widening or narrowing alike: the client's
+// consent step decided). It reports whether any head's trust actually
+// changed, which is what makes a restart necessary; an invalid trust token
+// fails the whole update before anything is saved.
+func applyServers(cfg *config.Config, serverList []any) (trustChanged bool, err error) {
 	for _, item := range serverList {
 		sm, ok := item.(map[string]any)
 		if !ok {
@@ -1610,9 +1896,32 @@ func applyServers(cfg *config.Config, serverList []any) {
 					applyLeafPreferences(&cfg.Servers[i].LeafPreferences, lp)
 				}
 			}
+			if v, ok := sm["trusted_runtimes"]; ok {
+				arr, ok := v.([]any)
+				if !ok {
+					return false, fmt.Errorf("servers[%q].trusted_runtimes must be a list of runtime names", name)
+				}
+				raw := make([]string, 0, len(arr))
+				for _, item := range arr {
+					s, ok := item.(string)
+					if !ok {
+						return false, fmt.Errorf("servers[%q].trusted_runtimes must contain only runtime names, got %v", name, item)
+					}
+					raw = append(raw, s)
+				}
+				trusted, perr := parseTrustedRuntimes(raw)
+				if perr != nil {
+					return false, fmt.Errorf("servers[%q].%w", name, perr)
+				}
+				if !trustedRuntimesEqual(cfg.Servers[i].TrustedRuntimes, trusted) {
+					trustChanged = true
+				}
+				cfg.Servers[i].TrustedRuntimes = trusted
+			}
 			break
 		}
 	}
+	return trustChanged, nil
 }
 
 func applyLeafPreferences(lp *config.LeafPreferences, m map[string]any) {
@@ -1694,53 +2003,122 @@ func toStringSlice(arr []any) []string {
 
 // ContainerRuntimeStatusResponse is the response for GET /api/v1/container-runtime.
 type ContainerRuntimeStatusResponse struct {
-	Backend        string  `json:"backend"`
-	Status         string  `json:"status"`
-	Version        string  `json:"version"`
-	SocketPath     string  `json:"socket_path"`
-	MachineRequired bool   `json:"machine_required"`
-	MachineName    string  `json:"machine_name"`
-	MachineCPUs    int     `json:"machine_cpus"`
-	MachineMemoryMB int   `json:"machine_memory_mb"`
-	MachineDiskGB  int     `json:"machine_disk_gb"`
-	Error          *string `json:"error"`
+	Backend string `json:"backend"`
+	// Engine names what actually answers the socket the registered runtime is
+	// connected to: "podman" when Podman serves the Docker-compatible socket
+	// (Podman Desktop's Docker compatibility, podman-mac-helper), "docker" for
+	// Docker itself, "" when the runtime could not be asked. Backend alone
+	// labelled such a host "Docker" in the app's runtime card and advised
+	// installing the Podman that was already running (TB-73).
+	Engine string `json:"engine"`
+	// Status is one of running, stopped, not_initialized, not_installed,
+	// starting, error, or unreachable — the last when an engine that was in
+	// service stopped answering and the daemon is re-probing it (TB-80); the
+	// machine's own "running" claim is overridden then, since a Podman
+	// machine can report running with a dead API socket.
+	Status          string  `json:"status"`
+	Version         string  `json:"version"`
+	SocketPath      string  `json:"socket_path"`
+	MachineRequired bool    `json:"machine_required"`
+	MachineName     string  `json:"machine_name"`
+	MachineCPUs     int     `json:"machine_cpus"`
+	MachineMemoryMB int     `json:"machine_memory_mb"`
+	MachineDiskGB   int     `json:"machine_disk_gb"`
+	Error           *string `json:"error"`
+	// Redetecting reports that the daemon has no container runtime but keeps
+	// probing for an engine (a head is trusted for container work), so an
+	// engine started now is picked up without a restart (TB-59).
+	Redetecting bool `json:"redetecting"`
 }
 
-// GetContainerRuntimeStatus returns the current container runtime state.
+// GetContainerRuntimeStatus returns the container runtime state AS THE DAEMON
+// HAS IT — the engine the registered runtime is connected to, or the Podman
+// machine's own state when a binary was found but its machine is not up —
+// never the config's backend preference on its own. That preference is empty
+// on an auto-configured host, so the old answer was "none / not_installed"
+// beside a daemon running containers (TB-59).
 func (b *DaemonBridge) GetContainerRuntimeStatus() ContainerRuntimeStatusResponse {
-	cfg := b.daemon.GetConfig()
+	backend, registered := b.daemon.ContainerBackend()
 	mm := b.daemon.GetMachineManager()
 
 	resp := ContainerRuntimeStatusResponse{
-		Backend: cfg.ContainerBackend,
+		Backend:     "none",
+		Status:      "not_installed",
+		Redetecting: b.daemon.ContainerRedetectActive(),
 	}
 
-	if cfg.ContainerBackend == "" {
-		resp.Backend = "none"
-		resp.Status = "not_installed"
+	if mm != nil {
+		// A Podman binary has been found (at start or by a later probe): the
+		// machine's own state is the truth about whether containers can run.
+		resp.Backend = string(runtime.BackendPodman)
+		resp.MachineRequired = mm.NeedsMachine()
+		info := mm.Status()
+		resp.Status = string(info.Status)
+		resp.SocketPath = info.SocketPath
+		resp.MachineName = info.Name
+		resp.MachineCPUs = info.CPUs
+		resp.MachineMemoryMB = info.MemoryMB
+		resp.MachineDiskGB = info.DiskGB
+		if info.Error != "" {
+			resp.Error = &info.Error
+		}
+	}
+
+	if registered {
+		if backend.Backend != "" {
+			resp.Backend = string(backend.Backend)
+		}
+		resp.Engine = backend.Engine
+		resp.Version = backend.Version
+		if resp.SocketPath == "" {
+			resp.SocketPath = backend.SocketPath
+		}
+		// With no machine to report on (Docker, or Podman on Linux), a
+		// registered runtime is a running one.
+		if mm == nil || !mm.NeedsMachine() {
+			resp.Status = "running"
+		}
 		return resp
 	}
 
+	// An engine that was in service and stopped answering (TB-80): the
+	// runtime is out of service and re-probed every minute. This overrides
+	// the machine's own state above — a Podman machine can report running
+	// while its API socket is dead, which is exactly the outage.
+	if outBackend, outErr, _, down := b.daemon.ContainerOutage(); down {
+		if outBackend.Backend != "" {
+			resp.Backend = string(outBackend.Backend)
+		}
+		resp.Engine = outBackend.Engine
+		resp.Version = outBackend.Version
+		if outBackend.SocketPath != "" {
+			resp.SocketPath = outBackend.SocketPath
+		}
+		resp.Status = "unreachable"
+		if outErr != "" {
+			resp.Error = &outErr
+		}
+		return resp
+	}
+
+	// Not registered. A probe that found an engine but could not build the
+	// runtime (socket not up yet, connection refused) says why, unless the
+	// machine state above is the better explanation.
 	if mm == nil {
-		// No machine manager — check the backend string only.
-		resp.Status = "running" // assume running if configured but no manager
-		return resp
+		if lastErr := b.daemon.ContainerDetectError(); lastErr != "" {
+			resp.Status = "error"
+			resp.Error = &lastErr
+		}
 	}
-
-	resp.MachineRequired = mm.NeedsMachine()
-	info := mm.Status()
-	resp.Status = string(info.Status)
-	resp.SocketPath = info.SocketPath
-	resp.MachineName = info.Name
-	resp.MachineCPUs = info.CPUs
-	resp.MachineMemoryMB = info.MemoryMB
-	resp.MachineDiskGB = info.DiskGB
-
-	if info.Error != "" {
-		resp.Error = &info.Error
-	}
-
 	return resp
+}
+
+// RequestContainerRedetect asks the daemon to probe for a container engine
+// now (TB-59). The probe runs on the daemon's own loop — a Podman machine
+// bring-up can take a minute — so this returns at once; the status route
+// reports the outcome.
+func (b *DaemonBridge) RequestContainerRedetect() error {
+	return b.daemon.RequestContainerRedetect()
 }
 
 // SetupContainerRuntime initializes and starts the container runtime.
@@ -1750,26 +2128,18 @@ func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
 		return fmt.Errorf("no container runtime configured")
 	}
 
-	// Use config defaults if not specified, with hard minimums.
-	cfg := b.daemon.GetConfig()
+	// Use the size start-up would give a new machine (the resource limits with
+	// their floors, memory plus the VM headroom — daemon.MachineSizeFor, TB-63)
+	// for anything the request left unspecified.
+	cpusDefault, memDefault, diskDefault := daemon.MachineSizeFor(b.daemon.GetConfig().ResourceLimits)
 	if cpus <= 0 {
-		cpus = cfg.ResourceLimits.MaxCPUCores
+		cpus = cpusDefault
 	}
 	if memoryMB <= 0 {
-		memoryMB = cfg.ResourceLimits.MaxMemoryMB
+		memoryMB = memDefault
 	}
 	if diskGB <= 0 {
-		diskGB = cfg.ResourceLimits.MaxDiskGB
-	}
-	// Hard minimums (same as cli/start.go).
-	if cpus <= 0 {
-		cpus = 2
-	}
-	if memoryMB <= 0 {
-		memoryMB = 4096
-	}
-	if diskGB <= 0 {
-		diskGB = 20
+		diskGB = diskDefault
 	}
 	// Reasonable upper bounds.
 	if cpus > 128 {
@@ -1782,7 +2152,14 @@ func (b *DaemonBridge) SetupContainerRuntime(cpus, memoryMB, diskGB int) error {
 		diskGB = 10000
 	}
 
-	return mm.Setup(cpus, memoryMB, diskGB)
+	if err := mm.Setup(cpus, memoryMB, diskGB); err != nil {
+		return err
+	}
+	// The machine is up: have the daemon build and register the runtime now
+	// rather than at its next scheduled probe (TB-59). Not applicable (already
+	// registered, or no head trusted for containers) is fine.
+	_ = b.daemon.RequestContainerRedetect()
+	return nil
 }
 
 // StartContainerRuntime starts the Podman machine (if applicable).
@@ -1798,7 +2175,12 @@ func (b *DaemonBridge) StartContainerRuntime() error {
 	if status.Status == runtime.MachineNotInitialized {
 		return runtime.ErrNotInitialized
 	}
-	return mm.Start()
+	if err := mm.Start(); err != nil {
+		return err
+	}
+	// As in SetupContainerRuntime: register the runtime now, not next minute.
+	_ = b.daemon.RequestContainerRedetect()
+	return nil
 }
 
 // StopContainerRuntime stops the Podman machine (if applicable).

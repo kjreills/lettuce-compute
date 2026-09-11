@@ -32,12 +32,32 @@ func registerHandlers(mux *http.ServeMux, bridge *DaemonBridge) {
 	mux.HandleFunc("POST /api/v1/container-runtime/setup", handleSetupContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/container-runtime/start", handleStartContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/container-runtime/stop", handleStopContainerRuntime(bridge))
+	mux.HandleFunc("POST /api/v1/container-runtime/redetect", handleRedetectContainerRuntime(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/suspend", handleSuspendTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/resume", handleResumeTask(bridge))
 	mux.HandleFunc("POST /api/v1/tasks/{work_unit_id}/abort", handleAbortTask(bridge))
 	mux.HandleFunc("GET /api/v1/tasks/{work_unit_id}/details", handleGetTaskDetails(bridge))
 	mux.HandleFunc("GET /api/v1/results", handleListResults(bridge))
 	mux.HandleFunc("GET /api/v1/results/{work_unit_id}", handleGetResult(bridge))
+	mux.HandleFunc("GET /api/v1/notices", handleGetNotices(bridge))
+}
+
+// handleGetNotices serves the volunteer-facing notice ring. ?since=<id>
+// returns only notices created after that id (all of them when absent), so a
+// client can poll cheaply with the latest_id from its previous response.
+func handleGetNotices(bridge *DaemonBridge) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var since uint64
+		if s := r.URL.Query().Get("since"); s != "" {
+			n, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "VALIDATION_ERROR", "since must be a non-negative integer notice id")
+				return
+			}
+			since = n
+		}
+		writeJSON(w, bridge.GetNotices(since))
+	}
 }
 
 func handleGetStatus(bridge *DaemonBridge) http.HandlerFunc {

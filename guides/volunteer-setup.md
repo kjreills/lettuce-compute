@@ -6,6 +6,13 @@ more **heads** (Lettuce servers), and your machine crunches **work units** for
 their **leafs** (computations). Results are validated and credit is tracked
 automatically.
 
+> **Prefer an app?** **Lettuce Compute** is the desktop version of this same program —
+> a setup wizard, task and history views, replayable visualizations, and a tray icon, for
+> Windows, macOS and Linux. Get it from this repository's GitHub Releases (the release
+> tagged `desktop-v…`). Everything in this guide still applies underneath: the app bundles
+> `lettuce-volunteer` and shares the same account and data directory, so the app and the
+> terminal client are interchangeable.
+
 > **First tool to reach for:** `lettuce-volunteer doctor`. It checks your
 > identity, disk, container runtime (it actually pings the socket), and every
 > attached head — and tells you exactly what's wrong and how to fix it. Run it
@@ -23,7 +30,15 @@ automatically.
 ```
 
 You can `attach` to multiple heads run by different operators; the CLI spreads
-work across all of them.
+work across all of them. `--server` (on `attach` and `init`, and the address
+field in the desktop app) takes the head's host name; a pasted URL such as
+`https://head.example.com/` is accepted too — the scheme and path are dropped,
+and a port in the address (`head.example.com:8443`) is used for both gRPC and
+HTTP. An `http://` address means the head is reached without TLS. A head that
+an older build stored as a URL is repaired the next time the config loads —
+`start` logs one `repaired stored head address` line naming the old and new
+targets and the entry is written back at the next config save — so there is
+nothing to detach or re-add after an update.
 
 ## Logs — attach this when asking for help
 
@@ -45,14 +60,18 @@ Map the message in your log (or from `doctor`) to the cause and fix:
 
 | Log message / symptom | Cause | Fix |
 |---|---|---|
-| `not fetching work: disk-gated …` (`reason=…data dir…`) | Free space on the data-dir volume doesn't cover what an enabled leaf declares it needs (its disk requirement + a 2 GB floor), or is below the floor entirely. The reason names the numbers. | Free space, or `--data-dir` on a roomier volume. With several leafs enabled, only the ones that fit are fetched; this WARN fires when none fit. |
+| `not fetching leaf: disk-gated …` (`leaf_slug=…`, `raise_to_gb=…`) | This one leaf's disk need does not fit right now — free space, the image store, or your `max_disk_gb` allowance (the reason says which) — while your other leafs keep fetching. Logged once when the leaf becomes gated; the same message is a warning in the desktop app's **Needs attention** list, naming the leaf, until the gate clears. | Whatever the reason names: free space, or raise `resource_limits.max_disk_gb` to the `raise_to_gb` value (the app's Projects tab shows the same figure per leaf). The warning clears by itself once the leaf fetches again, or if you disable the leaf. |
+| `not fetching work: disk-gated …` (`reason=…data dir…`) | Free space on the data-dir volume doesn't cover what any enabled leaf declares it needs (its disk requirement + a 2 GB floor), or is below the floor entirely. The reason names the numbers. | Free space, or `--data-dir` on a roomier volume. With several leafs enabled, only the ones that fit are fetched; this WARN fires when none fit (each gated leaf also has its own line, above). |
 | `not fetching work: disk-gated …` (`reason=…image store…`) | The container image-store volume (named in the reason) can't hold the fresh image pull an enabled leaf needs, even if the data dir has room. | Free space there, repoint the engine's store (Docker `data-root` / Podman `graphroot`) to a roomier disk, or enlarge the Podman-machine disk. `doctor` prints the path. |
-| `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
-| `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and you have no working Docker/Podman. | Set up a container runtime (below), or attach a head with native leafs. |
-| `connected but getting no work after repeated polls …` | The head's queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `not fetching work: disk-gated …` (`reason=disk budget…`) | Lettuce's own footprint (work folders + downloaded images) plus the leaf's need would exceed your `max_disk_gb` allowance, for every enabled leaf. | Free space (superseded images are reclaimed automatically), disable an unused leaf, or raise `resource_limits.max_disk_gb` — the message names the value that clears the gate. |
+| `no runnable leafs: every attached leaf needs a container runtime …` | The head's leafs are container leafs and no working Docker/Podman answered. The daemon keeps checking for one every minute and starts container work as soon as one answers (it re-registers with the head by itself), so this is also what a Docker Desktop or Podman machine that is still starting looks like. | Start or set up a container runtime (below) — no restart needed — or attach a head with native leafs. |
+| `connected but getting no work after repeated polls …` | The head was asked several times and had nothing for this machine: its queue is empty right now, or filters exclude you. | Usually normal — wait. The head tells you when to check back; see "How the volunteer paces its work" below. If persistent, check `doctor` and your leaf preferences. |
+| `no runnable leafs: every attached leaf needs a runtime this volunteer has not trusted its head to run …` | Every enabled leaf needs a runtime you declined for this head at attach time (or that this machine lacks). The volunteer does not even ask for those leafs — the head would refuse — so this is reported at once, not after polling. | If you accept running that head's code: `lettuce-volunteer heads trust <head> <runtime>` and restart. Otherwise enable a leaf you can run, or attach another head. |
 | `no work for leaf (empty assignments)` repeating | You're a native-only box and the leaf is container-only. | Install a container runtime, or this leaf isn't for you. |
 | `no available runtime for work unit (requires CONTAINER)` then abandon | You advertised CONTAINER but it doesn't actually work. | Fix the container runtime; `doctor` will tell you why it's unusable. |
-| `docker is not available … Is the docker daemon running?` | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
+| `container engine stopped answering …` (`container_engine_unreachable` in the app's **Needs attention** list; the runtime card reads "not answering") | The Docker or Podman engine Lettuce was using has stopped answering on its socket — Docker Desktop quit, the Podman machine was stopped, or (macOS) the machine still says "running" but its API socket is dead. Lettuce paused container work at once, returned every buffered container unit to its head **un-run** (nothing is billed to you or the unit), told the heads it has no container runtime for now, and re-checks the engine every minute. WASM and native leafs keep running. | Start the engine again (`podman machine start`, or Docker Desktop). A Podman machine that reports running with a dead socket is fixed by `podman machine stop` then `podman machine start`. Container work resumes by itself within a minute of the engine answering — no restart; the log line is `container engine answering again`. |
+| `container engine found but its runtime could not be built … container engine unreachable` at start | Detection found an engine (a Podman binary, or a socket file) but nothing answered on the socket — a rootless Podman socket that isn't started, a socket file left by a service that is not running. Lettuce does **not** advertise CONTAINER on a socket that does not answer; it re-checks every minute. | `systemctl --user enable --now podman.socket` (see below), or start the engine. |
+| `docker is not available … Is the docker daemon running?` (older builds) | Rootless Podman socket isn't started. | `systemctl --user enable --now podman.socket` (see below). |
 | `permission denied … /run/user/1000/podman/podman.sock` | Socket owned by a different user, or you ran under `sudo`. | Run lettuce as your **normal user**, not sudo; the socket owner must match. |
 
 ---
@@ -101,6 +120,78 @@ loginctl enable-linger "$USER"                # keep it alive when logged out
 Install **Podman Desktop** or **Docker Desktop** and make sure the machine/VM is
 started. If you have the Podman CLI, the bundled lettuce binary will create and
 start a Podman machine for you on first `start`.
+
+- **The engine does not have to be up before Lettuce is.** A daemon that finds
+  no engine at start runs WASM-only and checks again every minute; when Docker
+  Desktop finishes launching or a Podman machine is started (by you, by another
+  program, or by the daemon's own machine setup once it can see the `podman`
+  binary), the container runtime is registered and every attached head is told
+  about it without a restart. The desktop app's runtime card shows "Check again
+  now" while this is happening; the log line is `container runtime registered
+  after start`.
+
+- **The engine can also go away and come back.** If the engine stops answering
+  while Lettuce is running (Docker Desktop quit, the machine stopped, or a
+  Podman machine that still says "running" with a dead API socket — a known
+  macOS state, fixed by `podman machine stop` then `start`), Lettuce pauses
+  container work at once, returns every buffered container unit to its head
+  un-run so nothing is billed, tells the heads it has no container runtime for
+  now, and re-checks the engine every minute. The runtime card reads "not
+  answering" with the engine's error and offers "Check again now"; the
+  **Needs attention** list carries `container_engine_unreachable` until the
+  engine answers, when container work resumes by itself. A unit that was
+  already running inside a container when the engine died is lost and reported
+  to its head with the engine named as the reason; it does not count against
+  the leaf.
+
+- **The machine's memory is the real ceiling for container work.** On Windows
+  and macOS every container runs inside the engine's virtual machine (the Podman
+  machine, or Docker Desktop's engine VM), so a container can only use what that
+  machine has, whatever your Settings allow. Lettuce reads the machine's memory
+  from the engine when it finds it and budgets container work at that figure less
+  512 MB kept back for the machine itself. If that is below your memory limit
+  (`resource_limits.max_memory_mb`), heads are told the smaller figure and only
+  send leafs that fit it — before this a 16 GB Mac with a 2 GB Podman machine
+  advertised 8 GB, was sent 7 GB units, and had each one killed at model load
+  (`non-zero exit code 137`, now reported as `killed for memory` with both
+  figures). The log line is `container engine's VM is smaller than the memory
+  limit`, the desktop app shows a notice, `lettuce-volunteer doctor` prints both
+  figures under "memory limit", and a leaf blocked this way says so in `leafs
+  list` and on the app's leaf card. To run bigger leafs, enlarge the machine's
+  memory — Podman Desktop or Docker Desktop: Settings → Resources; Podman CLI:
+  `podman machine stop`, `podman machine set --memory <MB>`, `podman machine
+  start` — then restart Lettuce. Raising the memory limit alone changes nothing.
+  A machine Lettuce creates for you is sized at your memory limit plus the 512 MB
+  reserve, so it is never the bound.
+
+- **The machine's CPUs bound your CPU limit the same way.** Container work can
+  use no more CPUs than the virtual machine has, so if your CPU limit
+  (`resource_limits.max_cpu_cores`) is above the machine's CPU count, Lettuce
+  works to the machine's count instead: heads are told the smaller figure, the
+  running tasks share it, and you are told once — the log line is `container
+  engine's VM has fewer CPUs than the CPU limit`, the desktop app shows a
+  notice and says so under the CPU slider, and `lettuce-volunteer doctor`
+  prints both figures under "cpu limit". To use more cores, give the machine
+  more CPUs (Podman Desktop or Docker Desktop: Settings → Resources; Podman
+  CLI: `podman machine stop`, `podman machine set --cpus <n>`, `podman machine
+  start`) and restart Lettuce. A machine Lettuce creates for you is sized at
+  your CPU limit, so it is never the bound.
+
+- **macOS: Podman does not need to be on the app's PATH.** An app launched from
+  Finder runs with a minimal PATH that omits `/opt/podman/bin` (the official
+  installer and Podman Desktop), `/opt/homebrew/bin` and `/usr/local/bin`
+  (Homebrew), so lettuce probes those locations itself, in that order, and
+  drives the binary it finds by absolute path. `CONTAINER_HOST` / `DOCKER_HOST`
+  (`unix:///path/to.sock`) override the socket on macOS exactly as on Linux.
+- **"Docker-compatible … served by Podman".** When the only thing lettuce finds
+  is the Docker socket and Podman is behind it (Podman Desktop's Docker
+  compatibility switch, `podman-mac-helper`), the log, `doctor` and the desktop
+  app's runtime card say so instead of calling it Docker; rootful/rootless and
+  the compatibility switch only decide whether that socket exists, not whether
+  containers run. On that path lettuce does not manage the Podman machine
+  (start, stop and resize it from Podman Desktop or `podman machine`); to have
+  it managed, `lettuce-volunteer config set container_backend podman` and
+  restart.
 
 ---
 
@@ -152,7 +243,9 @@ work files.
   (when the daemon is running), so one paste clears the gate — no
   raise-and-check-again loop. Raise it with
   `lettuce-volunteer config set resource_limits.max_disk_gb <n>` and restart the
-  daemon, which is when the new figure is re-advertised.
+  daemon, which is when a figure set from the command line is re-advertised. A
+  limit changed in the desktop app reaches the running daemon at once: heads
+  are told the new figures on the next poll, with no restart.
 - **`max_gpu_vram_pct` is the same kind of trap, and sharper, because it is a
   percentage.** A head does not compare a GPU leaf's memory requirement against
   your card's size — it compares it against the *share of the card you allow*,
@@ -163,9 +256,9 @@ work files.
   your machine offers and the card it came from, and suggest the percentage that
   would clear it; where no percentage can (the card really is too small) they say
   that instead. Raise it with
-  `lettuce-volunteer config set resource_limits.max_gpu_vram_pct <n>` and restart.
-  A leaf may also require a particular make of card, which the same commands
-  report.
+  `lettuce-volunteer config set resource_limits.max_gpu_vram_pct <n>` and restart
+  (or change it in the desktop app, which needs no restart). A leaf may also
+  require a particular make of card, which the same commands report.
 - **Moving the data dir changes your identity** unless you copy
   `identity.key`/`.pub` across — a new keypair is a new volunteer.
 
@@ -334,6 +427,20 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   top-ups at the target line. Buffered work is reserved for you by the head (not
   yet started), so it is cheap to hand back if you stop, and it is only
   downloaded/prepared right before it runs.
+- **GPU work is buffered per GPU, not per task slot.** A unit that needs a GPU
+  runs one at a time per physical GPU, however many concurrent tasks you allow.
+  So on a machine with one GPU and eight task slots the buffer holds at most
+  `work_buffer_hours` of GPU units (2 h by default), not eight times that, and
+  requests for a GPU leaf are sized to that smaller target; CPU leafs still fill
+  the full per-slot buffer beside it. Without this bound such a machine hoarded
+  GPU units only one slot could ever run and handed most of them back unrun at
+  the deadline.
+- **It only asks for work it could be handed.** A leaf whose runtime this
+  machine does not have, or that you have not trusted its head to run
+  (`lettuce-volunteer heads trust <head> <runtime>` opts in), is never requested
+  — the head would refuse it anyway. If every attached leaf is excluded this
+  way, the "getting no work" warning says which runtime is missing or untrusted
+  instead of blaming an empty queue (see the table near the top of this guide).
 - **"Full" also means usable.** If a slot is idle but nothing in the buffer can
   start beside what's already running (say every buffered unit needs more memory
   than you have left), the buffer does not count as full: the volunteer keeps
@@ -354,9 +461,24 @@ Your volunteer does **not** poll on a fixed schedule. Instead:
   request-and-return loop. Returned units cost the work unit nothing: the head
   records them as unused give-backs (not failures) and simply avoids re-offering
   the same unit to the same machine for a few minutes.
+- **It learns how long each leaf's units really take on your machine.** Until a
+  leaf has completed a unit here, its units are booked at a rough figure derived
+  from a short single-core CPU benchmark run at first start — a poor yardstick
+  for GPU work or a container using many cores, so those first bookings can be
+  hours too high. From the first completion on, each leaf's units are booked at
+  the middle value of the last five completions on this machine (kept in
+  `durations.json` in the data directory, so a restart remembers it). That
+  figure decides how many units fill `work_buffer_hours`, how many are asked for
+  at once, and the starting point of the **remaining-time** figure shown for a
+  running unit in `status` and the desktop app. The remaining-time figure also
+  follows the unit's own progress reports as it runs, trusting them more the
+  further along the unit is, so on a leaf that is new to your machine the first
+  unit's estimate can be off; later units of the same leaf are estimated from
+  what the earlier ones actually took.
 - **Buffered units start first-fit, not strictly first-fetched.** A free slot
   takes the oldest buffered unit that fits in the memory you've allowed
-  (`resource_limits.max_memory_mb`). If the oldest unit needs more memory than
+  (`resource_limits.max_memory_mb` — or, on Windows/macOS, what the container
+  engine's machine can hold, when that is less). If the oldest unit needs more memory than
   is currently free, smaller units behind it start instead of the slot sitting
   idle — the waiting unit logs a single `waiting for capacity` line, keeps its
   place in line, and only a bounded number of units may jump it before the
@@ -397,8 +519,8 @@ Two things make this volunteer-friendly:
 
 | Config key | Default | What it does |
 |---|---|---|
-| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task. Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
-| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this. |
+| `work_buffer_hours` | `2.0` | How many hours of work to keep buffered per concurrent task (per GPU for GPU-required units, which run one per GPU). Larger = fewer, larger requests and more resilience to a head being briefly unreachable; smaller = leaner. `0` falls back to a small fixed unit count. |
+| `max_concurrent_tasks` | `1` | How many work units run at once. The buffer target scales with this, except that GPU units are bounded by the number of GPUs when that is smaller. |
 
 ```bash
 ./lettuce-volunteer config set work_buffer_hours 4
@@ -406,6 +528,38 @@ Two things make this volunteer-friendly:
 
 > **Replaces `work_buffer_size`.** Earlier releases sized the buffer as a unit
 > count via `work_buffer_size`. That key is gone; use `work_buffer_hours`.
+
+### CPU cores — one budget, shared by the running tasks
+
+`resource_limits.max_cpu_cores` (the **CPU Cores** slider in the desktop app) is
+the most CPU Lettuce will use on your machine, in total — the same kind of number
+as the memory and disk limits beside it. The tasks that are running share it
+equally: a task running alone is given the whole budget; when a second starts,
+each is given half; when one finishes, the survivor is given the whole again.
+The share is enforced on every task (a container's CPU quota, a cgroup or Job
+Object cap for native work) and adjusted live as tasks start and finish, so
+`max_cpu_cores: 2` means two cores whether `max_concurrent_tasks` is 1 or 4.
+Fractions are fine — three cores over two tasks is 1.5 each.
+
+Two consequences worth knowing:
+
+- **At most `max_cpu_cores` tasks run at once**, whatever `max_concurrent_tasks`
+  allows: each unit books its leaf's minimum core requirement (at least one) and
+  admission keeps the sum within the budget, so no task is ever given less than
+  its leaf declared it needs. A leaf that needs two cores runs alone under a
+  two-core budget; two one-core leafs run side by side.
+- **Each task is told its share.** Every task is started with
+  `LETTUCE_CPU_LIMIT=<cores>` (the exact share, possibly fractional) and the
+  standard thread-pool knobs (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`,
+  `MKL_NUM_THREADS`, `NUMEXPR_MAX_THREADS`) set to the same figure rounded to
+  whole threads, so a well-written leaf sizes its workers to what it was given
+  rather than to every CPU it can see. A running task cannot be told when its
+  share changes; only the cap moves.
+
+> **In earlier releases (through v0.12.1)** the figure was applied per task:
+> every task got the whole number as its own cap and nothing counted the total,
+> so "2 cores" with two tasks used four. If you lowered the slider to work
+> around that, you can put it back.
 
 ### Thermal protection
 
@@ -428,6 +582,22 @@ thermal:
   poll_interval_seconds: 10    # how often temperatures are sampled
   max_throttle_minutes: 30     # resume and re-check after this long frozen (negative = wait indefinitely)
 ```
+
+> **Which machines can read the CPU temperature.** Linux exposes it through the
+> kernel (`/sys/class/thermal`, `hwmon`) and the CPU thresholds work as described.
+> **macOS gives programs no CPU temperature without a helper:** install
+> [`osx-cpu-temp`](https://github.com/lavoiesl/osx-cpu-temp) with `brew install
+> osx-cpu-temp` (Intel Macs; Apple silicon Macs report nothing through it) and
+> restart Lettuce — the client looks on `PATH` and in the Homebrew prefixes, so a
+> Dock-launched app finds it too. **Windows only lets administrators read it**, and
+> asking can raise a permissions prompt, so the client does not try. Where the CPU
+> temperature cannot be read the CPU thresholds have **no effect**: the client says
+> so at start (`thermal protection cannot read this machine's CPU temperature` in
+> the log, a notice in the app, a `thermal` row in `lettuce-volunteer doctor`, and a
+> caption in the app's Thermal settings), the GPU thresholds still apply where
+> `nvidia-smi`/`rocm-smi` reports a temperature, and the hardware's own thermal
+> protection is unaffected. If you want the machine to back off under load rather
+> than heat, use *yield to other programs* below.
 
 > **Which sensors these apply to.** The CPU thresholds are compared against CPU
 > sensors only, and the GPU thresholds against GPU sensors only. Machines expose
@@ -465,6 +635,57 @@ thermal:
 > run a longer CPU-heavy leaf, and **restart the daemon** (config is read at
 > startup, not hot-reloaded). Watch the log for `thermal throttle activated` /
 > `thermal throttle released`.
+
+### Yield to other programs — pause when your computer is busy
+
+Lettuce pauses for a schedule, for heat and for you; it can also pause when
+**other programs need the CPU** — the workstation you are typing on, a render, or
+another volunteer client sharing the machine. The setting is **off by default**
+and lives under the `yield:` block of `~/.lettuce/config.yaml` (the app's
+Settings page has it as "When other programs need the CPU"):
+
+```bash
+lettuce-volunteer config set yield.enabled true
+lettuce-volunteer stop && lettuce-volunteer start   # read at startup
+```
+
+```yaml
+yield:
+  enabled: false          # master switch - off by default
+  cpu_pause_pct: 25       # pause when OTHER programs use this much of the CPU
+  cpu_resume_pct: 15      # resume once they use less than this (must be < cpu_pause_pct)
+  window_seconds: 30      # the average both thresholds are judged on
+  poll_interval_seconds: 5
+```
+
+When it is on, the client samples the whole machine's CPU use every few seconds,
+subtracts its own — the daemon, every native task's process tree, every running
+container — and averages what is left over the window. When that "foreign" share
+reaches `cpu_pause_pct`, **all** work freezes exactly as a thermal pause does (the
+running units are suspended in place, fetching stops); when it falls to
+`cpu_resume_pct`, everything resumes. `status` reads `Paused: busy — other programs
+are using 62% of the CPU (pause above 25%, resume below 15%)`, the app's status
+pill and tray say "Paused — your computer is busy", and the log has
+`yield pause: other programs are using the CPU`.
+
+> **Percentages are of all cores.** On an 8-core machine one fully busy core is
+> 12.5%, so the default 25% means "about two cores' worth of other work". Your own
+> Lettuce tasks never count, however many cores they use.
+
+> **Low-priority programs count.** A niced or "below normal" background job that
+> is using the CPU is still using the CPU; the client does not ignore it.
+
+> **A container engine on macOS or Windows runs inside a virtual machine.** The
+> VM shows up on the host as one process. Your own containers' CPU is measured
+> inside it and subtracted; the VM's own overhead is not, so it counts as "other
+> programs" — usually a few percent.
+
+> **If the client cannot measure the load it will not pause.** Lettuce's own share
+> must be known before the rest can be blamed on other programs; if a container's
+> statistics cannot be read, or a native task cannot be attributed, the client logs
+> `yield monitor cannot measure other programs' CPU use` once, raises a notice, and
+> pauses nothing until it can. `lettuce-volunteer doctor` has a `yield` row saying
+> whether the setting is on and whether the load can be measured here.
 
 ### Scheduling — run only at certain times
 
@@ -557,7 +778,9 @@ Within a head you can do the same per leaf, and opt a leaf in or out entirely:
 ```
 
 Add `--server <name>` to any `leafs` command to scope it to one head; omit it to
-apply across all of them.
+apply across all of them. Disabling every leaf of a head is allowed: the head stays
+attached and is simply asked for no work until you enable one again (the desktop
+app's leaf checkboxes work the same way).
 
 > **Capability still wins.** These preferences only re-rank work you can already
 > run — they can't make you eligible for a leaf your machine can't handle (e.g. a

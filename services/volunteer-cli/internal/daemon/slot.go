@@ -52,6 +52,10 @@ type ExecutionSlot struct {
 	preserved      *PersistedTask // non-nil if work dir was preserved on shutdown
 	processHandle  ProcessHandle  // for suspend/resume
 	suspended      bool
+	// cpuShare is the CPU share (cores) last pushed to this slot's process
+	// handle by ApplyCPUShare or the attach-time application (TB-75); 0 until
+	// one has been. It lets a rebalance skip slots already at the new share.
+	cpuShare float64
 	// suspendPending records that a suspend (schedule gate / pause) was requested
 	// while this slot was active but had no process handle yet — the window between
 	// StartSlot marking a re-executed resume active and the runtime registering the
@@ -93,10 +97,15 @@ func (s *ExecutionSlot) sessionPaused() time.Duration {
 
 // SlotResult is the outcome of a slot's execution.
 type SlotResult struct {
-	SlotID         int
-	WU             *runtime.WorkUnit
-	Result         *runtime.ExecutionResult
-	Conn           *ServerConnection
+	SlotID int
+	WU     *runtime.WorkUnit
+	Result *runtime.ExecutionResult
+	Conn   *ServerConnection
+	// Runtime is the runtime the slot executed the unit on. An execution error
+	// that says the container engine stopped answering names it, so the
+	// daemon takes THAT runtime out of service and not one a later probe has
+	// since registered for the recovered engine (TB-80).
+	Runtime        runtime.Runtime
 	Err            error
 	TotalPausedDur time.Duration // accumulated pause time for CPU time calculation
 	VizBundlePath  string        // from PrepareResult; non-empty if leaf has viz bundle
@@ -116,6 +125,18 @@ type SlotManager struct {
 	results      chan SlotResult // completed slot notifications
 	logger       *slog.Logger
 	shuttingDown atomic.Bool
+	// cpuShareFn answers "what CPU share does a running task get right now"
+	// (the daemon's current equal split of the budget, TB-75). Consulted when
+	// a process handle is attached, so a task whose handle appears after the
+	// split changed — another task started between its creation and its
+	// registration — is brought to the current share at once. Nil means no
+	// CPU budget is shared.
+	cpuShareFn func() float64
+}
+
+// SetCPUShareSource wires the daemon's current-share function (see cpuShareFn).
+func (sm *SlotManager) SetCPUShareSource(fn func() float64) {
+	sm.cpuShareFn = fn
 }
 
 // NewSlotManager creates a slot manager with the given number of slots.
@@ -257,6 +278,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 		slot.processHandle = nil
 		slot.suspended = false
 		slot.suspendPending = false
+		slot.cpuShare = 0
 		slot.pausedAt = time.Time{}
 		slot.totalPausedDur = 0
 		slot.fetchedAt = time.Time{}
@@ -271,6 +293,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			WU:             wu,
 			Result:         execResult,
 			Conn:           conn,
+			Runtime:        rt,
 			Err:            execErr,
 			TotalPausedDur: pausedDur,
 			VizBundlePath:  prep.VizBundlePath,
@@ -350,7 +373,7 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Warn("run-start StartWork failed; dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "error", swErr)
 			cancelExec()
-			sm.killDroppedOrphan(slot, wu, prep)
+			sm.killDroppedOrphan(slot, wu, prep, rt)
 			execErr = errStartWorkDropped
 			return
 		}
@@ -358,17 +381,23 @@ func (sm *SlotManager) runSlot(ctx context.Context, slot *ExecutionSlot, item *P
 			sm.logger.Info("run-start denied (unit reassigned or reservation lapsed); dropping unit",
 				"work_unit_id", wu.ID, "slot", slot.ID, "message", swResp.GetMessage())
 			cancelExec()
-			sm.killDroppedOrphan(slot, wu, prep)
+			sm.killDroppedOrphan(slot, wu, prep, rt)
 			execErr = errStartWorkDropped
 			return
 		}
 		sm.logger.Info("run-start StartWork ok", "work_unit_id", wu.ID, "slot", slot.ID, "server", conn.Name, "leaf_id", wu.LeafID)
 	}
 
-	// Wire process handle callbacks for suspend/resume.
+	// Wire process handle callbacks for suspend/resume, and for the live CPU
+	// share (TB-75): a native process is re-capped through the daemon's
+	// limiter, a container through the engine.
 	if prep != nil {
+		var setCPU func(pid int, shareCores float64) error
+		if d != nil {
+			setCPU = d.nativeSetCPU
+		}
 		prep.PIDCallback = func(pid int) {
-			sm.attachProcessHandle(slot, NewNativeProcessHandle(pid))
+			sm.attachProcessHandle(slot, NewNativeProcessHandle(pid, setCPU))
 		}
 		if cr, ok := rt.(*runtime.ContainerRuntime); ok {
 			prep.ContainerIDCallback = func(containerID string) {
@@ -405,9 +434,22 @@ var stopProcessFunc = StopProcess
 // killDroppedOrphan terminates a resumed orphan whose reservation lapsed at
 // run-start. A normal (non-orphan) drop has no process yet and is a no-op here;
 // only a resumed orphan (OrphanPID > 0) was already unfrozen and would otherwise
-// burn CPU unmonitored after runSlot deletes its work dir.
-func (sm *SlotManager) killDroppedOrphan(slot *ExecutionSlot, wu *runtime.WorkUnit, prep *runtime.PrepareResult) {
-	if prep == nil || prep.OrphanPID <= 0 {
+// burn CPU unmonitored after runSlot deletes its work dir. An adopted container
+// (OrphanContainerID, TB-74) was likewise already unpaused; it is removed, since
+// nothing else would ever supervise it.
+func (sm *SlotManager) killDroppedOrphan(slot *ExecutionSlot, wu *runtime.WorkUnit, prep *runtime.PrepareResult, rt runtime.Runtime) {
+	if prep == nil {
+		return
+	}
+	if prep.OrphanContainerID != "" {
+		if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+			sm.logger.Info("removing adopted container whose reservation lapsed at run-start",
+				"work_unit_id", wu.ID, "slot", slot.ID, "container", prep.OrphanContainerID)
+			cr.RemoveWorkUnitContainers(context.Background(), wu.ID, "")
+		}
+		return
+	}
+	if prep.OrphanPID <= 0 {
 		return
 	}
 	sm.logger.Info("terminating resumed orphan whose reservation lapsed at run-start",
@@ -567,10 +609,10 @@ func (sm *SlotManager) ActiveWorkDirs() []string {
 	return dirs
 }
 
-// GetCurrentTasks returns info about all active slots' work units.
-// benchmarkFPOPS is the volunteer's CPU benchmark score for time estimation.
-// dcfFunc returns the duration correction factor for a given leaf ID.
-func (sm *SlotManager) GetCurrentTasks(benchmarkFPOPS float64, dcfFunc func(leafID string) float64) []CurrentTask {
+// GetCurrentTasks returns info about all active slots' work units. estimate,
+// when non-nil, supplies each unit's expected total seconds from its leaf and
+// FP-ops estimate (the daemon's estSecondsForUnit); 0 leaves it unknown.
+func (sm *SlotManager) GetCurrentTasks(estimate func(leafID string, rscFpopsEst float64) float64) []CurrentTask {
 	var tasks []CurrentTask
 	for _, slot := range sm.slots {
 		slot.mu.Lock()
@@ -608,13 +650,8 @@ func (sm *SlotManager) GetCurrentTasks(benchmarkFPOPS float64, dcfFunc func(leaf
 				task.CheckpointSequence = slot.checkpoint.Sequence()
 				task.LastCheckpointAt = slot.checkpoint.LastSaveAt()
 			}
-			// Compute estimated duration from benchmark + fpops + DCF.
-			if slot.wu.RscFpopsEst > 0 && benchmarkFPOPS > 0 {
-				dcf := 1.0
-				if dcfFunc != nil {
-					dcf = dcfFunc(slot.wu.LeafID)
-				}
-				task.EstimatedSeconds = (slot.wu.RscFpopsEst / benchmarkFPOPS) * dcf
+			if estimate != nil {
+				task.EstimatedSeconds = estimate(slot.wu.LeafID, slot.wu.RscFpopsEst)
 			}
 			tasks = append(tasks, task)
 		}
@@ -646,6 +683,65 @@ func (sm *SlotManager) TotalActiveMemoryMB(memCeilingMB int) int {
 		slot.mu.Unlock()
 	}
 	return total
+}
+
+// TotalActiveCPUCores returns the sum of the CPU cores booked by all active
+// slots' WUs, each booked at book(wu) — the daemon's bookedCPUCores, the
+// leaf's minimum core requirement clamped to the budget — so admission can
+// keep the sum of bookings within max_cpu_cores (TB-75).
+func (sm *SlotManager) TotalActiveCPUCores(book func(*runtime.WorkUnit) int) int {
+	total := 0
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.wu != nil {
+			total += book(slot.wu)
+		}
+		slot.mu.Unlock()
+	}
+	return total
+}
+
+// ApplyCPUShare gives every active slot's process shareCores of CPU — the
+// equal split of the budget the daemon recomputes when a task starts or
+// finishes (TB-75). A slot already at that share is skipped; a slot with no
+// handle yet is brought to the current share when its handle is attached
+// (attachProcessHandle). Failures are logged and the slot keeps the cap it
+// had: the share is a courtesy to the machine's owner, not a safety boundary.
+func (sm *SlotManager) ApplyCPUShare(shareCores float64) {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.processHandle != nil && slot.cpuShare != shareCores {
+			if err := slot.processHandle.SetCPUShare(shareCores); err != nil {
+				sm.logger.Warn("failed to give a running task its new CPU share; it keeps its previous cap",
+					"slot", slot.ID, "cores", runtime.FormatCores(shareCores), "error", err)
+			} else {
+				sm.logger.Debug("running task given its new CPU share", "slot", slot.ID, "cores", runtime.FormatCores(shareCores))
+			}
+			slot.cpuShare = shareCores
+		}
+		slot.mu.Unlock()
+	}
+}
+
+// OwnProcesses lists the containers of the active container tasks, with the
+// engine client that can read their stats, and counts the active native
+// tasks — what the yield monitor subtracts from the machine's load as
+// Lettuce's own (TB-83). WASM tasks run inside the daemon process and need
+// no entry.
+func (sm *SlotManager) OwnProcesses() (containers []OwnContainer, nativeTasks int) {
+	for _, slot := range sm.slots {
+		slot.mu.Lock()
+		if slot.active && slot.processHandle != nil {
+			switch h := slot.processHandle.(type) {
+			case *containerProcessHandle:
+				containers = append(containers, OwnContainer{Client: h.client, ContainerID: h.containerID})
+			case *nativeProcessHandle:
+				nativeTasks++
+			}
+		}
+		slot.mu.Unlock()
+	}
+	return containers, nativeTasks
 }
 
 // ActiveGPUCount returns the number of active slots running GPU work units.
@@ -757,9 +853,27 @@ func (sm *SlotManager) SetProcessHandle(slotID int, handle ProcessHandle) {
 // running on unsuspended. Best-effort: a failed suspend is logged and the pending
 // flag cleared, matching SuspendAll's behavior.
 func (sm *SlotManager) attachProcessHandle(slot *ExecutionSlot, handle ProcessHandle) {
+	// The current share is read BEFORE this slot is locked: computing it
+	// counts the active slots, which takes every slot's lock in turn.
+	var share float64
+	if handle != nil && sm.cpuShareFn != nil {
+		share = sm.cpuShareFn()
+	}
 	slot.mu.Lock()
 	defer slot.mu.Unlock()
 	slot.processHandle = handle
+	// Bring the task to the CURRENT CPU share (TB-75): the share it was
+	// created with is stale if another task started or finished between its
+	// creation and this registration, and a rebalance in that window could
+	// not reach it (no handle yet). A resumed container from a previous
+	// session is likewise still capped at that session's share.
+	if share > 0 && slot.cpuShare != share {
+		if err := handle.SetCPUShare(share); err != nil {
+			sm.logger.Warn("failed to give a newly registered task its CPU share; it keeps the cap it started with",
+				"slot", slot.ID, "cores", runtime.FormatCores(share), "error", err)
+		}
+		slot.cpuShare = share
+	}
 	if handle == nil || !slot.suspendPending || slot.suspended {
 		slot.suspendPending = false
 		return
@@ -809,6 +923,9 @@ func (sm *SlotManager) GetActivePersistableTasks() []PersistedTask {
 			}
 			if slot.processHandle != nil {
 				pt.PID = slot.processHandle.PID()
+				if h, ok := slot.processHandle.(*containerProcessHandle); ok {
+					pt.ContainerID = h.ContainerID()
+				}
 			}
 			tasks = append(tasks, pt)
 		}

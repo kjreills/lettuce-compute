@@ -50,6 +50,25 @@ type EngineInfo struct {
 	// Snapshotter is true when the engine reports the containerd snapshotter image
 	// store, where StoragePath (DockerRootDir) is not the image-store filesystem.
 	Snapshotter bool
+	// MemTotalMB is the total memory of the machine the engine daemon runs on,
+	// as the engine reports it (Docker's MemTotal; Podman's Docker-compatible
+	// /info reports the same field). On Linux that is the host's RAM. On macOS
+	// and Windows the engine runs inside a virtual machine — a Podman machine,
+	// Docker Desktop's engine VM — and this is THAT machine's memory: the real
+	// ceiling for every container, whatever the host has and whatever the
+	// configuration allows (TB-63). It is read from the engine rather than from
+	// `podman machine inspect`, because on a WSL-backed machine the inspect
+	// figure is the size Podman recorded at init while WSL sizes the VM by its
+	// own rules (half the host's RAM by default): on the operator's box inspect
+	// said 2048 MB while the engine reported 48 GB. 0 when the engine did not
+	// report it.
+	MemTotalMB int64
+	// NCPU is the number of CPUs the machine the engine daemon runs on has, as
+	// the engine reports it — on macOS and Windows the VM's vCPU count, the
+	// real ceiling for every container's CPU use whatever the host has and
+	// whatever the configuration allows (TB-75, the CPU twin of MemTotalMB).
+	// 0 when the engine did not report it.
+	NCPU int
 }
 
 // DockerClient abstracts the Docker Engine API operations needed by ContainerRuntime.
@@ -88,6 +107,18 @@ type DockerClient interface {
 	ContainerRemove(ctx context.Context, containerID string) error
 	ContainerPause(ctx context.Context, containerID string) error
 	ContainerUnpause(ctx context.Context, containerID string) error
+	// ContainerUpdateCPU replaces a running (or paused) container's CPU quota
+	// in place — the engine's update call, which rewrites the container's
+	// cgroup without restarting it. quota/period are the CFS pair (CFSQuota);
+	// 0/0 removes the cap. Used to give a container its new share of the CPU
+	// budget when another task starts or finishes (TB-75).
+	ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error
+	// ContainerCPUNanos is the CPU time a container has used so far, in
+	// nanoseconds, from one stats sample. Read every few seconds while the
+	// yield monitor runs, so Lettuce's own containers are never mistaken for
+	// other programs' load (TB-83). On macOS and Windows this is time on the
+	// engine VM's CPUs, which the caller converts against the host's.
+	ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error)
 	Close() error
 }
 
@@ -204,7 +235,7 @@ func (d *dockerClientWrapper) Info(ctx context.Context) (*EngineInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("docker info: %w", err)
 	}
-	return buildEngineInfo(info.DockerRootDir, info.DriverStatus), nil
+	return buildEngineInfo(info.DockerRootDir, info.DriverStatus, info.MemTotal, info.NCPU), nil
 }
 
 // pathExistsFunc reports whether a filesystem path exists. A package-level seam
@@ -228,8 +259,14 @@ var pathExistsFunc = func(p string) bool {
 // and include whichever exist, so the disk gate checks the filesystem the blobs
 // actually land on. Including only existing paths means a wrong guess degrades
 // to the prior DockerRootDir-only behavior rather than falsely blocking.
-func buildEngineInfo(dockerRootDir string, driverStatus [][2]string) *EngineInfo {
+func buildEngineInfo(dockerRootDir string, driverStatus [][2]string, memTotalBytes int64, ncpu int) *EngineInfo {
 	ei := &EngineInfo{StoragePath: dockerRootDir}
+	if memTotalBytes > 0 {
+		ei.MemTotalMB = memTotalBytes / (1024 * 1024)
+	}
+	if ncpu > 0 {
+		ei.NCPU = ncpu
+	}
 	seen := make(map[string]bool)
 	add := func(p string) {
 		if p == "" || seen[p] {
@@ -604,6 +641,39 @@ func (d *dockerClientWrapper) ContainerUnpause(ctx context.Context, containerID 
 	return d.cli.ContainerUnpause(ctx, containerID)
 }
 
+// IsContainerNotFound reports whether err is the engine saying the container
+// no longer exists — a task that finished and was removed between one look
+// and the next, not a failure.
+func IsContainerNotFound(err error) bool {
+	return err != nil && client.IsErrNotFound(err)
+}
+
+func (d *dockerClientWrapper) ContainerCPUNanos(ctx context.Context, containerID string) (uint64, error) {
+	resp, err := d.cli.ContainerStatsOneShot(ctx, containerID)
+	if err != nil {
+		return 0, fmt.Errorf("container stats: %w", err)
+	}
+	defer resp.Body.Close()
+	var stats container.StatsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&stats); err != nil {
+		return 0, fmt.Errorf("decode container stats: %w", err)
+	}
+	return stats.CPUStats.CPUUsage.TotalUsage, nil
+}
+
+func (d *dockerClientWrapper) ContainerUpdateCPU(ctx context.Context, containerID string, quota, period int64) error {
+	resp, err := d.cli.ContainerUpdate(ctx, containerID, container.UpdateConfig{
+		Resources: container.Resources{CPUQuota: quota, CPUPeriod: period},
+	})
+	if err != nil {
+		return fmt.Errorf("container update (cpu quota %d/%d): %w", quota, period, err)
+	}
+	for _, w := range resp.Warnings {
+		d.logger.Warn("container engine warned on CPU quota update", "container", containerID, "warning", w)
+	}
+	return nil
+}
+
 func (d *dockerClientWrapper) Close() error {
 	return d.cli.Close()
 }
@@ -617,4 +687,45 @@ func IsDockerAvailable() bool {
 	defer cli.Close()
 	_, err = cli.Ping(context.Background())
 	return err == nil
+}
+
+// DockerEngine reports which engine serves the Docker-compatible API the
+// default client reaches (the Docker socket, or DOCKER_HOST), and its version:
+// "podman" when the server's version components name Podman — its
+// compatibility API reports a "Podman Engine" component — "docker" otherwise,
+// and "" when the API could not be asked. The Docker probe only checks that
+// something answers on the Docker socket; on a Podman Desktop or
+// podman-mac-helper host that something is Podman, and the backend used to be
+// labelled "Docker" regardless (TB-54). The version is the server's own
+// (Podman's on that host), so the app's runtime card can show it (TB-73).
+func DockerEngine() (engine, version string) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", ""
+	}
+	defer cli.Close()
+	v, err := cli.ServerVersion(context.Background())
+	if err != nil {
+		return "", ""
+	}
+	names := make([]string, 0, len(v.Components))
+	for _, c := range v.Components {
+		names = append(names, c.Name)
+	}
+	return engineNameFromVersion(v.Platform.Name, names), v.Version
+}
+
+// engineNameFromVersion classifies a Docker-compatible server from its version
+// report: any component or platform naming Podman means Podman; otherwise the
+// server is taken to be Docker.
+func engineNameFromVersion(platform string, components []string) string {
+	for _, c := range components {
+		if strings.Contains(strings.ToLower(c), "podman") {
+			return "podman"
+		}
+	}
+	if strings.Contains(strings.ToLower(platform), "podman") {
+		return "podman"
+	}
+	return "docker"
 }

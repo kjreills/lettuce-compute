@@ -92,6 +92,16 @@ Not getting work? `./lettuce-volunteer doctor` gives a pass/fail diagnosis, and
 [volunteer setup guide](guides/volunteer-setup.md) covers per-OS container setup and
 troubleshooting. Update with `./lettuce-volunteer update`.
 
+### Desktop app
+
+A desktop application for Windows, macOS, and Linux is being built in
+[`apps/volunteer-desktop`](apps/volunteer-desktop/README.md) for volunteers who would rather not
+use a terminal. It wraps the client above: it starts `lettuce-volunteer` for you, walks you through
+setup (on Windows, including installing a container runtime), shows what your machine is working
+on, and updates itself. A head sees it as an ordinary client, because it is one. Installers will
+be published as `desktop-vX.Y.Z` releases; until then, and after, the command-line client remains
+the reference client, and everything the app can do, the client can do.
+
 ### A head is a trust domain
 
 Attaching to a head means trusting the person who runs it to execute code on your machine, so the
@@ -116,9 +126,14 @@ has that unit refused and handed straight back. Declining everything is durable;
 will not quietly re-grant it.
 
 Your machine also holds the line on resources. You set CPU cores, memory, disk, GPU VRAM share, and
-concurrent tasks. The client reserves exactly what it will enforce, using cgroups where available,
-container limits, or WASM memory pages. It stops fetching before your disk runs low, and pauses
-everything if your CPU gets too hot.
+concurrent tasks. Each limit is a budget for the whole machine: the CPU cores you allow are shared
+equally by every task that is running (a task alone gets them all; two tasks get half each, adjusted
+as tasks start and finish), and each task is told its share so it can size its worker pool. The
+client reserves exactly what it will enforce, using cgroups where available, container limits, or
+WASM memory pages. It stops fetching before your disk runs low, pauses everything if your CPU gets
+too hot (where the machine lets a program read its CPU temperature: Linux, or a Mac with the
+`osx-cpu-temp` helper — the client tells you when it cannot), and, if you turn the setting on,
+pauses everything while other programs need the CPU.
 
 ### Commands
 
@@ -361,7 +376,9 @@ docker compose -f compose.production.yaml up -d
 Migrations run automatically on startup. Some releases need extra steps before `up -d`; the release
 note and the [head setup guide](guides/head-setup.md) list them.
 
-To update a volunteer client, run `./lettuce-volunteer update` and restart the daemon.
+To update a volunteer client, run `./lettuce-volunteer update` and restart the daemon. The desktop
+app updates itself; its releases are tagged `desktop-vX.Y.Z` and described in the
+[desktop app README](apps/volunteer-desktop/README.md#releases).
 
 ## Development
 
@@ -388,6 +405,10 @@ head services.
 ```bash
 cd services/infrastructure && GOWORK=off go vet ./... && GOWORK=off go test ./...
 ```
+
+The desktop app has its own loop; `make desktop-sidecar` compiles the client it bundles and
+`make desktop-build` produces an installer. See the
+[desktop app README](apps/volunteer-desktop/README.md#development-loop).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow, including the integration-test setup.
 

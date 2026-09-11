@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,7 +30,23 @@ type Fetcher struct {
 	backoff     time.Duration
 	maxBackoff  time.Duration
 	cachedHW    *lettucev1.HardwareCapabilities
-	pubKey      ed25519.PublicKey
+	// hardwareFn returns the CURRENT advertisement (the daemon's
+	// advertisedHardware), which a late container-engine detection may have
+	// lowered the memory budget of (TB-63); cachedHW is the fallback for tests
+	// that build a Fetcher by hand.
+	hardwareFn func() *lettucev1.HardwareCapabilities
+	pubKey     ed25519.PublicKey
+	// notices receives the fetcher's volunteer-facing escalations (too-old
+	// rejection, runtime breaker trip, no-work diagnostic); headStatus keeps
+	// each head's update-required flag current. Both are nil-safe.
+	notices    *NoticeLog
+	headStatus *HeadStatusTracker
+
+	// emptyPolls counts consecutive fetch rounds that buffered nothing;
+	// warnedNoWork records that the streak already raised the one-time
+	// "connected but getting no work" diagnostic. See noteEmptyRound.
+	emptyPolls   int
+	warnedNoWork bool
 
 	// reRegisterFn re-registers this machine against one head after a host-unknown
 	// work-path refusal (BG-25 self-heal): it discards the refused id, registers with an
@@ -37,6 +54,27 @@ type Fetcher struct {
 	// new id (possibly empty). Injected from the daemon; nil disables self-heal (the
 	// refusal then falls through to the normal reconnect backoff).
 	reRegisterFn func(ctx context.Context, head *ServerConnection) (string, error)
+
+	// readvertiseFn re-registers this machine with one head when the runtimes it
+	// can run changed since that head last heard them — a container engine
+	// detected after start (TB-59). Called at the top of each head's turn,
+	// before any request, so the head's dispatch gate admits the newly runnable
+	// leafs instead of refusing them until a restart. nil disables it.
+	readvertiseFn func(ctx context.Context, head *ServerConnection)
+
+	// engineUnreachableFn takes a container runtime whose engine stopped
+	// answering out of service (Daemon.NoteContainerEngineUnreachable, TB-80).
+	// Called once per outage from bufferBatch, on the fetcher's goroutine.
+	// nil in tests that never exercise it.
+	engineUnreachableFn func(rt runtime.Runtime, err error) bool
+
+	// runtimeBlockedFn re-evaluates whether EVERY attached leaf is
+	// runtime-blocked (needs a runtime this machine lacks or the volunteer has
+	// not trusted its head for — the pre-request skip's own verdict) and keeps
+	// the "runtime_blocked" notice in step with it, returning the verdict
+	// (TB-60). Owned by the daemon so the notice survives fetcher restarts and
+	// a late runtime registration can resolve it. nil = never blocked.
+	runtimeBlockedFn func() bool
 
 	// enabledLeafsFunc is called to get enabled leafs for a server.
 	// Injected from the daemon to reuse its filtering logic.
@@ -79,6 +117,16 @@ type Fetcher struct {
 	// daemon; nil disables the skip.
 	leafNeedsAbsentGPUFn func(leaf CachedLeafInfo) bool
 
+	// leafClassBufferFullFn reports a leaf whose resource class — GPU work, the
+	// one class bounded tighter than the slot count — has already reached its
+	// own hours target (TB-48). Such a leaf is skipped BEFORE RequestWorkUnit:
+	// asking for it would only produce arrivals the buffer refuses on the spot.
+	// A round in which every remaining leaf was skipped this way is "buffer
+	// full for what this machine can use", not "the head has no work" — Run
+	// waits on the buffer cadence and leaves the no-work diagnostic alone.
+	// Injected from the daemon; nil disables the skip.
+	leafClassBufferFullFn func(leaf CachedLeafInfo) (bool, string)
+
 	// --- CLIENT WORK BUFFER (Layer 1) ---
 	// workBufferFullFn reports whether the hours-based client work buffer is full.
 	// When it returns true the fetcher issues ZERO RequestWorkUnit calls (DoD #2).
@@ -103,9 +151,16 @@ type Fetcher struct {
 	// back to the head for immediate re-dispatch instead of being held past its
 	// usefulness and dropped at 90 % of deadline. nil accepts everything.
 	bufferAcceptsFn func(wu *runtime.WorkUnit) (bool, string)
+	// unfitBufferedFn is the buffer-sweep half of a live resource-limit change
+	// (TB-79): it names why a BUFFERED unit can no longer run on this machine
+	// ("" when it still can). sweepBuffer gives such units back un-run. nil
+	// keeps everything.
+	unfitBufferedFn func(wu *runtime.WorkUnit) string
 	// batchSizeFn returns how many assignments to request for a leaf given an
-	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest].
-	batchSizeFn func(estSecondsPerUnit float64) int32
+	// estimate of seconds-per-unit, clamped to [1, maxBatchPerRequest]. The leaf
+	// is passed so a GPU-required leaf is sized against the GPU class's own
+	// deficit, not the whole buffer's (TB-48).
+	batchSizeFn func(leaf CachedLeafInfo, estSecondsPerUnit float64) int32
 	// leafEstSecondsFn estimates wall-clock seconds for ONE unit of the given leaf
 	// (0 = unknown), used to size the per-leaf batch request BEFORE any of that
 	// leaf's units have been buffered (#29). It prefers the leaf-level,
@@ -197,12 +252,37 @@ const runtimeAbandonPauseThreshold = 3
 const reservationDropMargin = 60 * time.Second
 
 // sweepBuffer drops buffered units that have aged out, on two independent
-// grounds. Idempotent and cheap (one mutex, one pass over a short slice), so it
-// is safe to call from both the fetcher loop and the daemon's buffer-maintenance
+// grounds, and gives back units a resource-limit change has made unrunnable.
+// Idempotent and cheap (one mutex, one pass over a short slice), so it is safe
+// to call from both the fetcher loop and the daemon's buffer-maintenance
 // ticker — whichever is still running.
 func (f *Fetcher) sweepBuffer() {
 	// Deadline safety: drop at 90% of the unit's deadline.
 	f.queue.DropExpiring(0.1)
+
+	// A unit whose declaration the live budget no longer covers (the memory
+	// limit was lowered after it was buffered, TB-79) can never start here:
+	// admission would refuse it forever and the starvation cap would hold
+	// backfills behind it. Give it back now, flagged un-run so the head closes
+	// the copy RETURNED (budget-neutral, TB-35) and re-offers it at once.
+	if f.unfitBufferedFn != nil {
+		for _, u := range f.queue.DropUnfit(func(item *PreFetchItem) string {
+			if item == nil || item.WU == nil {
+				return ""
+			}
+			return f.unfitBufferedFn(item.WU)
+		}) {
+			f.logger.Info("fetcher: returning buffered unit this machine can no longer run", "work_unit_id", u.Item.WU.ID, "leaf_id", u.Item.WU.LeafID, "reason", u.Reason)
+			if u.Item.Conn != nil && u.Item.Conn.Client != nil {
+				f.giveBackWorkUnit(context.Background(), u.Item.Conn, u.Item.WU, u.Reason)
+			}
+			if u.Item.Runtime != nil && u.Item.Prep != nil {
+				if err := u.Item.Runtime.Cleanup(u.Item.Prep); err != nil {
+					f.logger.Warn("cleanup failed for returned item", "work_unit_id", u.Item.WU.ID, "error", err)
+				}
+			}
+		}
+	}
 
 	// Drop buffered items whose head-side reservation window has (nearly) lapsed.
 	// With per-task heartbeats removed, the reservation window (reserved_until) is
@@ -231,8 +311,14 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		backoff:                  d.initialBackoff,
 		maxBackoff:               d.maxBackoff,
 		cachedHW:                 d.cachedHW,
+		hardwareFn:               d.advertisedHardware,
 		pubKey:                   d.pubKey,
+		notices:                  d.notices,
+		headStatus:               d.headStatus,
 		reRegisterFn:             d.reRegisterHost,
+		readvertiseFn:            d.readvertiseIfPending,
+		runtimeBlockedFn:         d.refreshRuntimeBlocked,
+		engineUnreachableFn:      d.NoteContainerEngineUnreachable,
 		enabledLeafsFunc:         d.enabledLeafs,
 		leafPrefsFunc:            d.leafPreferences,
 		serverBlockedLeafIDsFunc: d.serverBlockedLeafIDs,
@@ -240,10 +326,12 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 		leafFailurePausedFn:      d.leafFailurePaused,
 		leafDiskGateFn:           d.leafDiskGate,
 		leafNeedsAbsentGPUFn:     d.leafNeedsAbsentGPU,
+		leafClassBufferFullFn:    d.leafClassBufferFull,
 		workBufferFullFn:         d.workBufferFull,
 		starvedBackfillFn:        d.starvedBackfill,
 		leafFitGateFn:            d.leafFitGate,
 		bufferAcceptsFn:          d.bufferAccepts,
+		unfitBufferedFn:          d.unfitBuffered,
 		batchSizeFn:              d.requestBatchSize,
 		leafEstSecondsFn:         d.leafEstSeconds,
 		noteArrivalEstFn:         d.noteArrivalEstimate,
@@ -256,10 +344,13 @@ func NewFetcher(d *Daemon, queue *PreFetchQueue, selector *WeightedSelector, lea
 	}
 }
 
-// noWorkWarnThreshold is how many consecutive empty polls (no work returned)
-// trigger the one-time "connected but getting no work" diagnostic WARN. With
-// exponential backoff this is roughly half a minute of genuine idleness, long
-// enough to skip a momentarily-empty queue but short enough to be useful.
+// noWorkWarnThreshold is how many consecutive empty polls — rounds in which a
+// head was actually asked and answered with no work — trigger the one-time
+// "connected but getting no work" diagnostic WARN. Each such round obeys the
+// head's retry delay, so this is roughly half a minute of genuine idleness,
+// long enough to skip a momentarily-empty queue but short enough to be useful.
+// A round that asked nothing (every leaf skipped before the request) is not a
+// poll and does not count (TB-60).
 const noWorkWarnThreshold = 5
 
 // idleWait is how long the fetcher sleeps when there is nothing to do right now
@@ -274,12 +365,6 @@ const idleWait = 5 * time.Second
 // retry_after_seconds the volunteer obeys via ServerConnection.NextContactAt.
 func (f *Fetcher) Run(ctx context.Context) {
 	f.logger.Info("fetcher: started", "max_batch_per_request", maxBatchPerRequest)
-
-	// Track a run of empty polls so we can surface "connected but no work — here's
-	// why" exactly once, instead of leaving the operator staring at a silent,
-	// idle daemon.
-	emptyPolls := 0
-	warnedNoWork := false
 
 	for {
 		select {
@@ -343,7 +428,7 @@ func (f *Fetcher) Run(ctx context.Context) {
 		f.logger.Debug("fetcher: attempting fetchOne", "queue_len", f.queue.Len())
 
 		// Try to fetch a batch of work units.
-		got, err := f.fetchOne(ctx)
+		round, err := f.fetchRound(ctx)
 		if err != nil {
 			f.logger.Warn("fetcher: fetchOne returned error", "error", err)
 			if !f.sleep(ctx, idleWait) {
@@ -352,13 +437,53 @@ func (f *Fetcher) Run(ctx context.Context) {
 			continue
 		}
 
-		if got == 0 {
-			f.logger.Debug("fetcher: fetchOne buffered no work")
-			emptyPolls++
-			if emptyPolls >= noWorkWarnThreshold && !warnedNoWork {
-				f.warnNoWork()
-				warnedNoWork = true
+		if round.pushed == 0 && round.requested == 0 {
+			// Nothing was asked of any head, so this round says nothing about the
+			// heads and must not feed the "no work after repeated polls" streak
+			// (TB-60): with the pre-request skips a runtime-blocked host asked
+			// nothing every round and the notice fired 5 s after start, claiming
+			// polls that never happened.
+			if round.classFull > 0 {
+				// TB-48: every leaf left to ask about belongs to a resource class
+				// whose buffer is already at target — the GPU class on a host with
+				// more slots than GPUs. That is the buffer being full for what this
+				// machine can use, not the head having no work: wait on the loop's
+				// poll granularity (no RPC, no retry delay to obey).
+				f.logger.Debug("fetcher: every requestable leaf is at its class buffer target, not requesting", "class_full_leafs", round.classFull)
+				if !f.sleep(ctx, idleWait) {
+					return
+				}
+				continue
 			}
+			// Every attached leaf runtime-blocked is a static configuration fact
+			// with its own notice, raised at once and kept current by the daemon
+			// (runtime_blocked); poll slowly — nothing changes until a runtime is
+			// registered (TB-59) or the leaf set does. Every other request-less
+			// round (a paused runtime or leaf, a disk or fit gate, an absent GPU,
+			// no head reachable) already has its own notice: stay silent.
+			if f.runtimeBlockedFn != nil && f.runtimeBlockedFn() {
+				f.logger.Debug("fetcher: no attached leaf can run on this machine; not requesting")
+				if !f.sleep(ctx, idleWait) {
+					return
+				}
+				continue
+			}
+			f.logger.Debug("fetcher: nothing requested this round (every leaf skipped for a reason with its own notice, or no head reachable)")
+			if !f.sleep(ctx, f.backoff) {
+				return
+			}
+			continue
+		}
+
+		// A request went out, so at least one leaf passed the runtime gate: keep
+		// the runtime-blocked verdict current (it resolves its notice if live).
+		if f.runtimeBlockedFn != nil {
+			f.runtimeBlockedFn()
+		}
+
+		if round.pushed == 0 {
+			f.logger.Debug("fetcher: fetchOne buffered no work")
+			f.noteEmptyRound()
 			// No work was buffered this cycle (no assignments, or every assignment
 			// was abandoned as unusable). The authoritative cadence is the head's
 			// retry delay, obeyed via NextContactAt by the head-eligibility gate at
@@ -371,11 +496,34 @@ func (f *Fetcher) Run(ctx context.Context) {
 			continue
 		}
 
-		// Got work — clear the no-work streak so the diagnostic can fire again if
-		// the volunteer later goes idle for a new reason.
-		emptyPolls = 0
-		warnedNoWork = false
+		f.noteWorkArrived()
 	}
+}
+
+// noteEmptyRound counts one fetch round that asked a head for work and
+// buffered nothing. When the streak reaches noWorkWarnThreshold it surfaces
+// the "connected but getting no work" diagnostic exactly once, instead of
+// leaving the operator staring at a silent, idle daemon. Run only calls it
+// for rounds that issued a request (TB-60).
+func (f *Fetcher) noteEmptyRound() {
+	f.emptyPolls++
+	if f.emptyPolls >= noWorkWarnThreshold && !f.warnedNoWork {
+		f.warnNoWork()
+		f.warnedNoWork = true
+	}
+}
+
+// noteWorkArrived ends a no-work streak: the diagnostic can fire again if the
+// volunteer later goes idle for a new reason, and any live no_work notice is
+// resolved, because work arriving is exactly that condition ending — it used
+// to outlive hours of completed units (TB-50). The resolve is unconditional
+// rather than gated on this fetcher's own warnedNoWork: the fetcher is
+// recreated on every pause/resume, and the notice an earlier instance raised
+// is still in the ring.
+func (f *Fetcher) noteWorkArrived() {
+	f.emptyPolls = 0
+	f.warnedNoWork = false
+	f.notices.Resolve("no_work", "", "")
 }
 
 // sleep waits for d or until ctx is cancelled. Returns false if ctx was
@@ -423,38 +571,44 @@ func (f *Fetcher) waitUntilHeadEligible() (time.Duration, bool) {
 	return wait, true
 }
 
-// warnNoWork emits the one-time "connected but getting no work" diagnostic. It
-// compares the leafs the volunteer is attached to against the runtimes it can
-// actually run: if every attached leaf needs a container runtime this box lacks,
-// that's the (fixable) reason and it says so; otherwise the queue is most likely
-// just empty, which it reports without crying wolf.
+// warnNoWork emits the one-time "connected but getting no work" diagnostic:
+// the heads were asked, repeatedly, and had nothing for this machine. Since
+// TB-60 it is reached only after rounds that actually issued a request, so
+// the "every leaf is runtime-blocked" cases — a static configuration fact
+// that used to be the first two branches here — cannot be what it is
+// reporting; that verdict has its own notice (runtime_blocked, raised at
+// once by the daemon). A partly blocked host is noted in passing, because a
+// leaf the machine can never run is one the head is never asked for.
 func (f *Fetcher) warnNoWork() {
-	hasContainer := f.registry != nil && f.registry.GetRuntime("container") != nil
 	var runtimes []string
 	if f.registry != nil {
 		runtimes = f.registry.AvailableRuntimes()
+		sort.Strings(runtimes)
 	}
 
-	var totalLeafs, containerBlocked int
+	var totalLeafs, runtimeBlocked int
 	if f.enabledLeafsFunc != nil && f.multiClient != nil {
 		for _, srv := range f.multiClient.Servers() {
 			for _, lf := range f.enabledLeafsFunc(srv.Name) {
 				totalLeafs++
-				if lf.ExecutionSpec != nil && lf.ExecutionSpec.Image != "" && !hasContainer {
-					containerBlocked++
+				if _, missing, untrusted := leafRuntimeVerdict(lf, f.registry, srv.Config); missing || untrusted {
+					runtimeBlocked++
 				}
 			}
 		}
 	}
 
-	if totalLeafs > 0 && containerBlocked == totalLeafs {
-		f.logger.Warn("connected but getting no work: every attached leaf needs a container runtime this volunteer doesn't have — install Docker or Podman (see the volunteer setup docs), or attach a head with native leafs",
-			"runtimes", runtimes, "leafs", totalLeafs)
-		return
+	blockedNote := ""
+	if runtimeBlocked > 0 {
+		blockedNote = fmt.Sprintf(" %d of the %d attached leaf(s) need a runtime this machine does not offer their head and are never requested.", runtimeBlocked, totalLeafs)
 	}
 	f.logger.Warn("connected but getting no work after repeated polls — the head has no matching units for this volunteer right now",
-		"runtimes", runtimes, "attached_leafs", totalLeafs,
+		"runtimes", runtimes, "attached_leafs", totalLeafs, "runtime_blocked_leafs", runtimeBlocked,
 		"hint", "normal if the queue is just empty; if it persists, check that your runtimes match the leafs and that disk/scheduling aren't pausing fetches")
+	f.notices.Notify(NoticeWarn, "no_work",
+		fmt.Sprintf("Connected but getting no work after repeated polls: the attached heads have no units matching this machine right now (%d attached leaf(s); runtimes: %s). This is normal when a queue is empty; if it persists, check that the leafs match this machine's runtimes and that disk space or the schedule is not pausing fetches.%s",
+			totalLeafs, strings.Join(runtimes, ", "), blockedNote),
+		"", "")
 }
 
 // fetchOne issues at most one RequestWorkUnit (to the first eligible head/leaf
@@ -464,6 +618,25 @@ func (f *Fetcher) warnNoWork() {
 // on every reply it stamps head.NextContactAt from the head's authoritative
 // retry_after_seconds.
 func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
+	round, err := f.fetchRound(ctx)
+	return round.pushed, err
+}
+
+// fetchRound is what one fetchOne pass did, for the Run loop's cadence
+// decision: how many units it buffered, how many RequestWorkUnit calls it
+// issued, and how many leafs it skipped only because their resource class's
+// buffer is at target (TB-48). A pass with no request and a class-full skip is
+// the buffer being full, not the head being empty.
+type fetchRound struct {
+	pushed    int
+	requested int
+	classFull int
+}
+
+// fetchRound is fetchOne with the round's accounting; fetchOne keeps the
+// pushed-count contract for callers that only need that.
+func (f *Fetcher) fetchRound(ctx context.Context) (fetchRound, error) {
+	var round fetchRound
 	// ESCALATION (#15 fix 4): expire any paused runtimes whose cooldown has
 	// elapsed so they are re-probed once. Done here (not only inside runtimePaused)
 	// so a runtime no longer referenced by any leaf still clears eventually.
@@ -482,7 +655,7 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 	available := f.availableServers()
 	if len(available) == 0 {
 		f.logger.Debug("fetcher: no available servers")
-		return 0, nil
+		return round, nil
 	}
 	f.logger.Debug("fetcher: available servers", "count", len(available), "servers", serverNames(available))
 
@@ -508,6 +681,14 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 		if f.now().Before(head.NextContactAt) {
 			f.logger.Debug("fetcher: head waiting out retry delay", "server", head.Name, "next_contact_at", head.NextContactAt)
 			continue
+		}
+
+		// TB-59: if this machine's runtimes changed since this head last heard
+		// them (a container engine detected after start), re-register before
+		// asking — the head's dispatch gate only admits leafs whose runtime we
+		// advertised, and a refused request would look like an empty head.
+		if f.readvertiseFn != nil {
+			f.readvertiseFn(ctx, head)
 		}
 
 		enabled := f.enabledLeafsFunc(head.Name)
@@ -536,9 +717,11 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 				}
 			}
 			f.logger.Debug("fetcher: no cached leafs, requesting any-leaf", "server", head.Name, "leaf_ids", leafIDs, "blocked_ids", blockedIDs)
+			round.requested++
 			pushed, _ := f.requestAndBuffer(ctx, head, anyLeafInfo, leafIDs, blockedIDs)
 			if pushed > 0 {
-				return pushed, nil
+				round.pushed = pushed
+				return round, nil
 			}
 			continue
 		}
@@ -546,6 +729,21 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 
 		orderedLeafs := f.selector.SelectLeafByDeficitOrder(head.Name, enabled)
 		for _, leaf := range orderedLeafs {
+			// TB-49: a leaf whose runtime this machine never advertised to this
+			// head — not registered here, or the volunteer has not trusted the
+			// head to run it — is skipped BEFORE RequestWorkUnit. The head refuses
+			// such a request every time (its dispatch gate matches the leaf's
+			// runtime against what we advertised), so the RPC was one wasted call
+			// per leaf per round on every such host, and each refusal fired the
+			// head's capability-mismatch WARN — the tell for REAL
+			// misconfiguration, buried under healthy hosts asking for the one
+			// leaf they could never run.
+			if rt, missing, untrusted := leafRuntimeVerdict(leaf, f.registry, head.Config); missing || untrusted {
+				f.logger.Debug("fetcher: skipping leaf whose runtime this machine does not offer this head",
+					"server", head.Name, "leaf_slug", leaf.Slug, "runtime", rt, "registered", !missing, "trusted", !untrusted)
+				continue
+			}
+
 			// ESCALATION (#15 fix 4): if this leaf needs a runtime we've paused
 			// after repeated abandons, skip it BEFORE issuing RequestWorkUnit.
 			// This pre-request skip is the load-bearing stop for the
@@ -575,10 +773,26 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 				continue
 			}
 
+			// TB-48: a leaf whose resource class is already at its own buffer
+			// target (GPU units on a host with fewer GPUs than slots) is skipped
+			// BEFORE the disk gate and the request — its arrivals would be
+			// refused on the spot by bufferAccepts, so the RPC is pure churn.
+			if f.leafClassBufferFullFn != nil {
+				if full, reason := f.leafClassBufferFullFn(leaf); full {
+					round.classFull++
+					f.logger.Debug("fetcher: skipping leaf whose class buffer is at target", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
+					continue
+				}
+			}
+
 			// TB-24: skip a leaf whose disk gate refuses — free space does not
 			// cover ITS declared need right now — so its units are never
 			// requested only to die mid-pull, while affordable leafs keep
-			// fetching. shouldFetch owns the loud all-leafs-gated WARN.
+			// fetching. This skip is the enforcement only: shouldFetch's sweep
+			// owns the leaf's WARN and disk_gate_blocked notice (raised once
+			// when its gate flips to refusing, ended when it passes again —
+			// TB-70) and the all-leafs-gated WARN, so this line is the Debug
+			// trail of every round the skip actually ran.
 			if f.leafDiskGateFn != nil {
 				if ok, reason := f.leafDiskGateFn(leaf); !ok {
 					f.logger.Debug("fetcher: skipping disk-gated leaf", "server", head.Name, "leaf_slug", leaf.Slug, "reason", reason)
@@ -597,9 +811,11 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 				}
 			}
 
+			round.requested++
 			pushed, stop := f.requestAndBuffer(ctx, head, leaf, []string{leaf.ID}, nil)
 			if pushed > 0 {
-				return pushed, nil
+				round.pushed = pushed
+				return round, nil
 			}
 			if stop {
 				// Transport error or rate-limit on this head: stop trying its leafs.
@@ -610,7 +826,7 @@ func (f *Fetcher) fetchOne(ctx context.Context) (int, error) {
 	}
 
 	f.logger.Debug("fetcher: exhausted all eligible servers and leafs, no work buffered")
-	return 0, nil
+	return round, nil
 }
 
 // anyLeafInfo is the placeholder leaf descriptor used for the no-cached-leafs
@@ -647,7 +863,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	}
 	maxAssignments := int32(1)
 	if f.batchSizeFn != nil {
-		maxAssignments = f.batchSizeFn(estSec)
+		maxAssignments = f.batchSizeFn(leaf, estSec)
 	}
 	// TB-34 batch feedback: after a round whose tail this buffer returned, cap the
 	// ask at what that round actually kept + 1 until a round is kept in full — the
@@ -674,7 +890,7 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		LeafIds:          leafIDs,
 		BlockedLeafIds:   blockedIDs,
 		MaxAssignments:   maxAssignments,
-		CurrentAvailable: f.cachedHW,
+		CurrentAvailable: f.currentHardware(),
 		HeldWorkUnitIds:  heldIDs,
 	})
 	if err != nil {
@@ -743,6 +959,10 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 		if client.IsVolunteerTooOldError(err) {
 			f.logger.Warn("fetcher: this volunteer build is too old for the head; run 'lettuce-volunteer update'",
 				"server", head.Name, "leaf_slug", leaf.Slug, "error", err, "code", st.Code())
+			f.headStatus.MarkUpdateRequired(head.Config.GRPCAddress)
+			f.notices.Notify(NoticeWarn, "update_required",
+				fmt.Sprintf("Head %q rejected this volunteer build as too old; it will not serve work until the volunteer is updated. Run 'lettuce-volunteer update'. (%s)", head.Name, st.Message()),
+				head.Name, "")
 		} else {
 			// Connection error (Unavailable/Internal/etc.): no delay to obey, so fall
 			// back to the per-head exponential reconnect backoff.
@@ -762,9 +982,13 @@ func (f *Fetcher) requestAndBuffer(ctx context.Context, head *ServerConnection, 
 	}
 
 	// Success: obey the server-directed retry delay on EVERY reply, including the
-	// no-work path.
+	// no-work path. A head that answered is not rejecting this build, so any
+	// update-required flag it earned is cleared, and the notice that flag
+	// raised is resolved.
 	head.Available = true
 	head.Backoff = 0
+	f.headStatus.MarkContactOK(head.Config.GRPCAddress)
+	f.notices.Resolve("update_required", head.Name, "")
 	f.applyServerRetryDelay(head, resp.RetryAfterSeconds)
 
 	// No-work is an OK response carrying an empty assignments list (the
@@ -823,6 +1047,11 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			held[id] = struct{}{}
 		}
 	}
+	// engineDown names a runtime whose engine stopped answering during THIS
+	// batch (TB-80): the rest of the batch is returned un-run without another
+	// Prepare, and without the runtime lookup that would now fail — the
+	// outage took the runtime out of the registry — and bill the abandon.
+	engineDown := make(map[string]bool)
 	for _, asg := range assignments {
 		wu := runtime.WorkUnitFromProto(asg)
 		// Stamp the dispatching head (display name) on the unit: the artifact
@@ -871,6 +1100,12 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 			}
 		}
 
+		if engineDown[runtimeKeyForWU(wu)] {
+			f.logger.Info("fetcher: returning batch unit un-run; its container engine stopped answering earlier in this batch", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug)
+			f.giveBackWorkUnit(ctx, head, wu, "container engine unreachable")
+			continue
+		}
+
 		rt, selErr := f.registry.SelectRuntime(wu)
 		if selErr != nil {
 			f.logger.Warn("fetcher: no runtime for work unit", "work_unit_id", wu.ID, "runtime", wu.Runtime, "error", selErr)
@@ -902,6 +1137,24 @@ func (f *Fetcher) bufferBatch(ctx context.Context, head *ServerConnection, leaf 
 		// needs a keep-alive to look alive. Prepare directly.
 		prep, prepErr := rt.Prepare(ctx, wu)
 		if prepErr != nil {
+			if runtime.IsEngineUnreachable(prepErr) {
+				// The container engine did not answer the ping: an OUTAGE of the
+				// runtime, not a failure of this unit or this leaf. The unit was
+				// never started here, so it goes back un-run — budget-neutral,
+				// no bench (TB-35) — and the runtime is taken out of service at
+				// once and re-probed with a ping until the engine answers (TB-80).
+				// Before this every unit of every batch was a billed abandon and
+				// three of them raised "prepare failed 3 times".
+				name := strings.ToLower(rt.Name())
+				f.logger.Warn("fetcher: container engine unreachable at prepare; returning the batch un-run and pausing container work until the engine answers",
+					"work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", name, "error", prepErr)
+				f.giveBackWorkUnit(ctx, head, wu, prepErr.Error())
+				engineDown[name] = true
+				if f.engineUnreachableFn != nil {
+					f.engineUnreachableFn(rt, prepErr)
+				}
+				continue
+			}
 			f.logger.Warn("fetcher: prepare FAILED", "work_unit_id", wu.ID, "leaf_slug", leaf.Slug, "runtime", wu.Runtime, "error", prepErr)
 			// ESCALATION (#15 fix 4): capability category B — Prepare failed for
 			// this runtime (image pull / binary download / setup).
@@ -1010,6 +1263,15 @@ func (f *Fetcher) applyServerRetryDelay(head *ServerConnection, retryAfterSecond
 		"server", head.Name, "retry_after_s", retryAfterSeconds, "next_contact_at", head.NextContactAt)
 }
 
+// currentHardware returns the hardware advertisement to send with a poll: the
+// daemon's live one when wired, else the copy taken at construction.
+func (f *Fetcher) currentHardware() *lettucev1.HardwareCapabilities {
+	if f.hardwareFn != nil {
+		return f.hardwareFn()
+	}
+	return f.cachedHW
+}
+
 // applyResourceExhaustedBackoff applies a fixed, jittered LOCAL backoff to a head
 // that answered codes.ResourceExhausted. Unlike the server-directed retry delay,
 // ResourceExhausted carries no authoritative value (the head returned no body and
@@ -1042,9 +1304,9 @@ func withBackoffJitter(d time.Duration) time.Duration {
 // runtimeKeyForWU normalizes a work unit's runtime hint for the abandon counter,
 // mirroring RuntimeRegistry.SelectRuntime (empty -> "native").
 func runtimeKeyForWU(wu *runtime.WorkUnit) string {
-	name := strings.ToLower(wu.Runtime)
+	name := runtime.NormalizeRuntimeName(wu.Runtime)
 	if name == "" {
-		return "native"
+		return runtime.RuntimeNative
 	}
 	return name
 }
@@ -1088,6 +1350,10 @@ func (f *Fetcher) recordRuntimeAbandon(name string, err error) {
 		"last_error", err,
 		"remedy", remedyForRuntime(name),
 		"cooldown", runtimeAbandonCooldown)
+	f.notices.Notify(NoticeWarn, "prepare_failed",
+		fmt.Sprintf("The %s runtime failed to prepare work %d times in a row (last error: %v). Requests for leafs that need it are paused for %s, then retried once. %s",
+			name, count, err, runtimeAbandonCooldown, remedyForRuntime(name)),
+		"", "")
 }
 
 // resetRuntimeAbandon clears the abandon counter and any pause for a runtime
@@ -1099,6 +1365,7 @@ func (f *Fetcher) resetRuntimeAbandon(name string) {
 	if _, wasPaused := f.pausedRuntimes[name]; wasPaused {
 		delete(f.pausedRuntimes, name)
 		f.logger.Info("fetcher: runtime recovered, resuming requests", "runtime", name)
+		f.notices.Resolve("prepare_failed", "", "")
 	}
 }
 

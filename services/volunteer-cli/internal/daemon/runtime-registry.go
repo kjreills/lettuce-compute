@@ -2,14 +2,20 @@ package daemon
 
 import (
 	"fmt"
-	"strings"
+	"sync"
 
 	"github.com/lettuce-compute/volunteer-cli/internal/runtime"
 )
 
 // RuntimeRegistry manages multiple runtimes and selects the appropriate one
 // for each work unit based on the work unit's runtime field.
+//
+// It is read from the fetcher, every execution slot, the disk gate and the
+// management API's handlers, and — since TB-59 — written after start-up too,
+// when a container engine that was absent at start is detected and its
+// runtime registered late. Every method therefore takes the lock.
 type RuntimeRegistry struct {
+	mu       sync.RWMutex
 	runtimes map[string]runtime.Runtime
 }
 
@@ -22,7 +28,30 @@ func NewRuntimeRegistry() *RuntimeRegistry {
 
 // Register adds a runtime to the registry, keyed by its Name().
 func (r *RuntimeRegistry) Register(rt runtime.Runtime) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.runtimes[rt.Name()] = rt
+}
+
+// Unregister removes rt from the registry, but only if rt is the very
+// instance registered under its name. It reports whether it removed anything.
+// The identity check is what makes the container-outage path safe (TB-80): a
+// unit that was running on an engine when it died may report its failure
+// after a probe has already built and registered a fresh runtime for the
+// recovered engine, and that stale report must not take the new runtime out
+// of service.
+func (r *RuntimeRegistry) Unregister(rt runtime.Runtime) bool {
+	if rt == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	name := rt.Name()
+	if r.runtimes[name] != rt {
+		return false
+	}
+	delete(r.runtimes, name)
+	return true
 }
 
 // SelectRuntime picks the runtime for a work unit based on wu.Runtime.
@@ -33,12 +62,12 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 	// default let a (malicious or buggy) head omit the field to steer a unit onto the
 	// least-isolated backend; leaf creation already requires a runtime, so only such
 	// a head ever sends "".
-	name := strings.ToLower(wu.Runtime)
+	name := runtime.NormalizeRuntimeName(wu.Runtime)
 	if name == "" {
 		return nil, fmt.Errorf("work unit has no runtime specified; refusing to run it")
 	}
-	rt, ok := r.runtimes[name]
-	if !ok {
+	rt := r.GetRuntime(name)
+	if rt == nil {
 		return nil, fmt.Errorf("no available runtime for work unit (requires %s)", wu.Runtime)
 	}
 	if !rt.CanHandle(&wu.ExecutionSpec) {
@@ -49,11 +78,15 @@ func (r *RuntimeRegistry) SelectRuntime(wu *runtime.WorkUnit) (runtime.Runtime, 
 
 // GetRuntime returns the runtime registered under the given name, or nil if not found.
 func (r *RuntimeRegistry) GetRuntime(name string) runtime.Runtime {
-	return r.runtimes[strings.ToLower(name)]
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.runtimes[runtime.NormalizeRuntimeName(name)]
 }
 
 // AvailableRuntimes returns the names of all registered runtimes.
 func (r *RuntimeRegistry) AvailableRuntimes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.runtimes))
 	for name := range r.runtimes {
 		names = append(names, name)

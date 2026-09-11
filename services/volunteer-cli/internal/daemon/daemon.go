@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"sort"
+	"reflect"
+	goruntime "runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,8 +69,8 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 	resp, err := rc.RegisterVolunteer(ctx, &lettucev1.RegisterVolunteerRequest{
 		PublicKey:         d.pubKey,
 		DisplayName:       hostname,
-		Hardware:          d.cachedHW,
-		AvailableRuntimes: d.advertisedRuntimes(),
+		Hardware:          d.advertisedHardware(),
+		AvailableRuntimes: d.advertisedRuntimesFor(head.Config),
 		SchedulingMode:    d.cfg.Scheduling.Mode,
 		HostId:            "", // discard the refused id: empty => the head mints a fresh one
 	})
@@ -90,23 +90,6 @@ func (d *Daemon) reRegisterHost(ctx context.Context, head *ServerConnection) (st
 		}
 	}
 	return resp.HostId, nil
-}
-
-// advertisedRuntimes returns the UPPERCASE runtime enum names this daemon can actually
-// run, derived from the live registry (registry Name()s are lowercase). It mirrors the
-// list start.go advertises at initial registration so a self-heal re-register presents
-// the same capabilities.
-func (d *Daemon) advertisedRuntimes() []string {
-	if d.runtimeRegistry == nil {
-		return nil
-	}
-	names := d.runtimeRegistry.AvailableRuntimes()
-	out := make([]string, 0, len(names))
-	for _, n := range names {
-		out = append(out, strings.ToUpper(n))
-	}
-	sort.Strings(out)
-	return out
 }
 
 // Daemon manages the volunteer compute loop using concurrent execution slots
@@ -132,17 +115,59 @@ type Daemon struct {
 	thermalMonitor *runtime.ThermalMonitor
 	thermalPauseCh chan bool
 
+	// Yielding to other programs (TB-83): a second automatic pause source
+	// beside the thermal monitor, wired the same way. ownMeter keeps the
+	// daemon's own cumulative CPU time monotonic for its sampler.
+	yieldMonitor *runtime.YieldMonitor
+	yieldPauseCh chan bool
+	ownMeter     ownCPUMeter
+
 	// Backoff configuration (overridable for tests)
 	initialBackoff time.Duration
 	maxBackoff     time.Duration
 
-	// Cached hardware capabilities (detected once at startup)
+	// Cached hardware capabilities (detected once at startup). This is what
+	// every head is told and what each poll carries (CurrentAvailable). Read
+	// through advertisedHardware and replaced — never mutated in place — under
+	// hwMu, because the fetcher reads it on its own goroutine while a late
+	// container-engine detection may lower the advertised memory budget
+	// (setAdvertisedMemoryMB, TB-63).
 	cachedHW *lettucev1.HardwareCapabilities
+	hwMu     sync.RWMutex
+	// detectedGPUs is the raw GPU detection the advertisement's GPU list is
+	// derived from (DaemonConfig.DetectedGPUs); nil when unknown. Read under
+	// hwMu beside cachedHW.
+	detectedGPUs []*runtime.GpuDetectionResult
 
 	// Podman machine lifecycle (Windows/macOS). Whether this process started the
 	// machine (and so may stop it at shutdown, PB-27) is tracked by the manager
 	// itself — see runtime.PodmanMachineManager.StartedByThisProcess.
 	machineManager *runtime.PodmanMachineManager
+
+	// Late container-engine detection (TB-59, container_detect.go). The
+	// factory outlives every detection attempt (it owns the Podman machine
+	// manager and the PB-27 ownership record); containerRedetectCh wakes the
+	// loop for an on-demand probe; lastRedetectOutcome makes the loop's
+	// logging change-only; readvertisePending names the heads that have not
+	// yet been told this machine's changed runtimes.
+	containerFactory    *ContainerRuntimeFactory
+	containerRedetectMu sync.Mutex
+	containerRedetectCh chan struct{}
+	lastRedetectOutcome string
+	readvertiseMu       sync.Mutex
+	readvertisePending  map[string]bool
+	// containerOutage records a container engine that was in service and
+	// stopped answering (TB-80); nil while none is. Set by
+	// NoteContainerEngineUnreachable, cleared when a probe registers a
+	// runtime again. Read by the management API and the buffer sweep.
+	containerOutageMu sync.Mutex
+	containerOutage   *containerOutage
+
+	// runtimeBlocked records that every attached leaf is currently
+	// runtime-blocked and the "runtime_blocked" notice is live (TB-60); see
+	// refreshRuntimeBlocked.
+	runtimeBlockedMu sync.Mutex
+	runtimeBlocked   bool
 
 	// Leaf discovery and weighted scheduling.
 	leafCache        *LeafCache
@@ -164,11 +189,22 @@ type Daemon struct {
 	mu       sync.Mutex
 	stopping bool
 	running  bool
-	paused   bool
+	// paused is true while ANY automatic source holds a pause; the three
+	// flags say which. Each source is remembered on its own — the resource
+	// monitor (schedule window, low disk), the thermal monitor, the yield
+	// monitor — so one source resuming cannot unfreeze work another still
+	// holds. Both are maintained only by setAutoPause.
+	paused         bool
+	resourcePaused bool
+	thermalPaused  bool
+	busyPaused     bool
+	// pauseReason is the automatic source PauseReason reports while paused,
+	// derived by setAutoPause: "thermal", "busy" or "scheduled", ranked in
+	// that order when several hold at once.
+	pauseReason string
 
-	// User-initiated pause (separate from resource/thermal auto-pause).
+	// User-initiated pause (separate from the automatic sources above).
 	userPaused  bool
-	pauseReason string // "user", "thermal", "scheduled", ""
 	userPauseCh chan bool
 
 	// Daemon start time for uptime calculation.
@@ -179,18 +215,24 @@ type Daemon struct {
 	processGroup ProcessGroup
 	runCancel    context.CancelFunc // cancels all slot contexts on Stop()
 
-	// CPU benchmark score for runtime estimation.
+	// CPU benchmark score: the per-unit duration estimate's fallback before a
+	// leaf has completed on this machine (TB-58); also reported to heads.
 	benchmarkFPOPS float64
-	dcfTracker     *DCFTracker
+	// Unit durations learned per leaf from this machine's own completions — the
+	// per-unit estimate (estSecondsForUnit) and the first-request figure
+	// (leafEstSeconds) once a leaf has completed here.
+	durations *DurationTracker
 
-	// Per-leaf per-unit seconds observed on the most recent ARRIVED batch (TB-34):
-	// the mean estSecondsForUnit over the units a batch actually delivered. The
-	// batch-size estimate (leafEstSeconds) takes the max of this and the leaf-level
-	// figure, so one 60× over-ask corrects itself on the very next round instead of
-	// waiting on the DCF — which learns only from COMPLETIONS and so never hears
-	// about units that keep being returned un-run (the self-sustaining loop).
-	arrivalEstMu  sync.Mutex
-	arrivalEstSec map[string]float64
+	// Per-leaf FP-ops estimate of the most recent ARRIVED unit (TB-34): the
+	// batch-size estimate (leafEstSeconds) takes the max of the leaf-level figure
+	// and what this implies under the current per-unit estimate, so one 60×
+	// over-ask corrects itself on the very next round instead of waiting on
+	// completions — which never hear about units that keep being returned un-run
+	// (the self-sustaining loop). The FP-ops figure is kept rather than the
+	// seconds it implied at arrival, so the booking stays current as the leaf's
+	// learned duration changes (TB-58).
+	arrivalEstMu    sync.Mutex
+	arrivalFpopsEst map[string]float64
 
 	// Fetch-gate hysteresis (TB-34): once the buffer fills to the hours target,
 	// fetching stays closed until the REMAINING buffered work drains below the
@@ -234,6 +276,12 @@ type Daemon struct {
 	// volunteer that's idle on disk space says so instead of only at Debug.
 	diskGateMu     sync.Mutex
 	diskGateWarned bool
+	// diskGatedLeafs is the set of enabled leaf ids whose own disk gate refused
+	// at the last shouldFetch sweep, each carrying one live disk_gate_blocked
+	// notice and one WARN. A gate that blocks SOME leafs while others keep
+	// fetching used to leave no trace above Debug — the machine-wide WARN
+	// above fires only when every leaf is gated (TB-70). Guarded by diskGateMu.
+	diskGatedLeafs map[string]bool
 	// unstattableStores records image-store paths whose free space cannot be
 	// determined from this host (see noteUnstattableImageStore), so the
 	// informational log fires once per path per daemon run. Guarded by diskGateMu.
@@ -246,6 +294,21 @@ type Daemon struct {
 	slotStarveMu       sync.Mutex
 	slotStarvedSince   time.Time
 	slotStarveWarnedAt time.Time
+
+	// Volunteer-facing notices (see notices.go): the log's WARN/escalation
+	// sites mirrored into a ring the management API serves, so a desktop
+	// client can show what the log would otherwise say only to a reader of
+	// the log. Shared with the thermal monitor and the fetcher.
+	notices *NoticeLog
+
+	// Per-head version and update-required state (see head_status.go),
+	// keyed by gRPC address. Seeded at start-up from registration, then kept
+	// current by the fetcher on every work request to the head.
+	headStatus *HeadStatusTracker
+
+	// clientVersion is this build's version string, reported on the
+	// management API's status so a client can compare it with each head's.
+	clientVersion string
 }
 
 // DaemonConfig holds all dependencies for creating a Daemon.
@@ -261,6 +324,28 @@ type DaemonConfig struct {
 	// Multi-server: preferred way to configure servers.
 	Servers []*ServerConnection
 
+	// Hardware is the machine's already-detected capabilities (client.DetectHardware),
+	// advertised to heads and consulted for GPU budgets. Start-up detects once and
+	// passes the result here; when nil the daemon detects for itself (tests, and
+	// any caller without a prior detection).
+	Hardware *lettucev1.HardwareCapabilities
+	// DetectedGPUs is the raw GPU detection Hardware's advertisement was built
+	// from (client.DetectHardwareWithGPUs). The daemon keeps it so a changed
+	// GPU share (resource_limits.max_gpu_vram_pct, the per-GPU overrides) can
+	// be re-applied to the advertisement without probing the vendor tools
+	// again (TB-79). nil when the caller did not detect; the daemon then
+	// detects for itself, or leaves the advertised GPUs as they are.
+	DetectedGPUs []*runtime.GpuDetectionResult
+	// ClientVersion is this build's version string (the value `--version`
+	// prints), surfaced on GET /api/v1/status as client_version.
+	ClientVersion string
+	// Notices and HeadStatus are created by the daemon when nil. Start-up
+	// passes its own so notices and head state observed BEFORE the daemon
+	// exists — a too-old rejection at registration, a head's reported version
+	// — are carried into the running daemon rather than lost.
+	Notices    *NoticeLog
+	HeadStatus *HeadStatusTracker
+
 	// Legacy single-server fields (used if Servers is empty).
 	Client      WorkClient
 	VolunteerID string
@@ -268,9 +353,13 @@ type DaemonConfig struct {
 	Runtime         runtime.Runtime               // Legacy: wraps in single-entry registry if RuntimeRegistry is nil
 	RuntimeRegistry *RuntimeRegistry              // Preferred: explicit registry with multiple runtimes
 	MachineManager  *runtime.PodmanMachineManager // optional: Podman machine lifecycle
-	Logger          *slog.Logger
-	Limiter         resource.Limiter    // optional, auto-detected if nil
-	Scheduler       *resource.Scheduler // optional, created from config if nil
+	// ContainerFactory is the detector that built (or failed to build) the
+	// container runtime at start; the daemon keeps probing with it while no
+	// container runtime is registered (TB-59). nil disables re-detection.
+	ContainerFactory *ContainerRuntimeFactory
+	Logger           *slog.Logger
+	Limiter          resource.Limiter    // optional, auto-detected if nil
+	Scheduler        *resource.Scheduler // optional, created from config if nil
 }
 
 // NewDaemon creates a new daemon with the provided configuration.
@@ -302,36 +391,6 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		cfg.Logger.Warn("failed to create process group, child processes may outlive daemon", "error", pgErr)
 	}
 
-	// Wire resource limiter and process group hooks into any NativeRuntime. The
-	// limiter is enforced against a PER-UNIT copy of the configured limits whose
-	// memory ceiling is BookedMemMB(declared, configured) — the same clamped number
-	// admission books — so native enforcement matches admission instead of always
-	// capping at the whole configured budget (BG-16).
-	limits := &cfg.Config.ResourceLimits
-	perUnitLimits := func(declaredMemMB int) *config.ResourceLimits {
-		l := *limits
-		l.MaxMemoryMB = runtime.BookedMemMB(declaredMemMB, limits.MaxMemoryMB)
-		return &l
-	}
-	for _, rt := range registry.runtimes {
-		if nr, ok := rt.(*runtime.NativeRuntime); ok {
-			nr.SetCommandModifier(func(cmd *exec.Cmd, declaredMemMB int) error {
-				if pg != nil {
-					pg.ConfigureCommand(cmd)
-				}
-				return limiter.Apply(cmd, perUnitLimits(declaredMemMB))
-			})
-			nr.SetProcessNotifier(func(pid int, declaredMemMB int) (func(), error) {
-				if pg != nil {
-					if err := pg.Add(pid); err != nil {
-						cfg.Logger.Warn("failed to add process to group", "pid", pid, "error", err)
-					}
-				}
-				return limiter.Enforce(pid, perUnitLimits(declaredMemMB))
-			})
-		}
-	}
-
 	// Create thermal monitor.
 	thermalPauseCh := make(chan bool, 1)
 	thermalCfg := runtime.ThermalConfig{
@@ -344,6 +403,33 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		MaxThrottleMinutes:  cfg.Config.Thermal.MaxThrottleMinutes,
 	}
 	thermalMonitor := runtime.NewThermalMonitor(thermalCfg, thermalPauseCh, cfg.Logger)
+
+	// Create the yield monitor (TB-83): the same pause verb, for other
+	// programs' CPU use instead of heat. Its sampler needs the daemon (the
+	// daemon's own CPU use is what it subtracts), so that is wired below.
+	yieldPauseCh := make(chan bool, 1)
+	yieldMonitor := runtime.NewYieldMonitor(runtime.YieldConfig{
+		Enabled:             cfg.Config.Yield.Enabled,
+		CPUPausePct:         cfg.Config.Yield.CPUPausePct,
+		CPUResumePct:        cfg.Config.Yield.CPUResumePct,
+		WindowSeconds:       cfg.Config.Yield.WindowSeconds,
+		PollIntervalSeconds: cfg.Config.Yield.PollIntervalSeconds,
+	}, yieldPauseCh, cfg.Logger)
+
+	// Notices and per-head state: adopt start-up's instances when given (they
+	// may already hold a registration-time rejection), else start empty.
+	notices := cfg.Notices
+	if notices == nil {
+		notices = NewNoticeLog()
+	}
+	headStatus := cfg.HeadStatus
+	if headStatus == nil {
+		headStatus = NewHeadStatusTracker()
+	}
+	// The thermal monitor emits its own throttle notices (it alone knows the
+	// temperatures and the cause); it only needs somewhere to put them.
+	thermalMonitor.SetNoticeSink(notices)
+	yieldMonitor.SetNoticeSink(notices)
 
 	// Build multi-server client. Support both new Servers field and legacy
 	// Client/VolunteerID for backward compatibility with existing tests.
@@ -364,9 +450,15 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	multiClient := NewMultiServerClient(servers, cfg.Logger)
 
-	// Detect hardware once at startup (avoid repeated exec calls that
-	// trigger DiskPart/UAC popups on Windows).
-	hw := client.DetectHardware(cfg.Config)
+	// Use the hardware start-up already detected; detect here only when the
+	// caller did not. Detection launches vendor tools and reads platform
+	// registries, and a second probe per start is exactly what once raised a
+	// second UAC prompt on Windows.
+	hw := cfg.Hardware
+	detectedGPUs := cfg.DetectedGPUs
+	if hw == nil {
+		hw, detectedGPUs = client.DetectHardwareWithGPUs(cfg.Config)
+	}
 
 	// Run or load CPU benchmark for runtime estimation.
 	var benchFPOPS float64
@@ -382,8 +474,8 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 		hw.BenchmarkFpops = benchFPOPS
 	}
 
-	// Load duration correction factors.
-	dcfTracker := LoadDCFTracker(cfg.Config.DataDir)
+	// Load the unit durations learned from earlier completions.
+	durations := LoadDurationTracker(cfg.Config.DataDir)
 
 	// Create leaf cache (5 min refresh) and weighted selector.
 	leafCache := NewLeafCache(5*time.Minute, cfg.Logger)
@@ -400,31 +492,62 @@ func NewDaemon(cfg DaemonConfig) *Daemon {
 	}
 	ws.SetHeadWeights(headWeights)
 
-	return &Daemon{
-		cfg:              cfg.Config,
-		pubKey:           cfg.PubKey,
-		privKey:          cfg.PrivKey,
-		hostIDStore:      cfg.HostIDStore,
-		multiClient:      multiClient,
-		runtimeRegistry:  registry,
-		machineManager:   cfg.MachineManager,
-		logger:           cfg.Logger,
-		limiter:          limiter,
-		scheduler:        scheduler,
-		thermalMonitor:   thermalMonitor,
-		thermalPauseCh:   thermalPauseCh,
-		initialBackoff:   1 * time.Second,
-		maxBackoff:       30 * time.Second,
-		cachedHW:         hw,
-		leafCache:        leafCache,
-		weightedSelector: ws,
-		leafFailures:     newLeafFailureTracker(time.Now),
-		userPauseCh:      make(chan bool, 1),
-		processGroup:     pg,
-		benchmarkFPOPS:   benchFPOPS,
-		dcfTracker:       dcfTracker,
-		arrivalEstSec:    make(map[string]float64),
+	d := &Daemon{
+		cfg:                 cfg.Config,
+		pubKey:              cfg.PubKey,
+		privKey:             cfg.PrivKey,
+		hostIDStore:         cfg.HostIDStore,
+		multiClient:         multiClient,
+		runtimeRegistry:     registry,
+		machineManager:      cfg.MachineManager,
+		containerFactory:    cfg.ContainerFactory,
+		containerRedetectCh: make(chan struct{}, 1),
+		lastRedetectOutcome: "none",
+		logger:              cfg.Logger,
+		limiter:             limiter,
+		scheduler:           scheduler,
+		thermalMonitor:      thermalMonitor,
+		thermalPauseCh:      thermalPauseCh,
+		yieldMonitor:        yieldMonitor,
+		yieldPauseCh:        yieldPauseCh,
+		initialBackoff:      1 * time.Second,
+		maxBackoff:          30 * time.Second,
+		cachedHW:            hw,
+		detectedGPUs:        detectedGPUs,
+		leafCache:           leafCache,
+		weightedSelector:    ws,
+		leafFailures:        newLeafFailureTracker(time.Now),
+		userPauseCh:         make(chan bool, 1),
+		processGroup:        pg,
+		benchmarkFPOPS:      benchFPOPS,
+		durations:           durations,
+		arrivalFpopsEst:     make(map[string]float64),
+		notices:             notices,
+		headStatus:          headStatus,
+		clientVersion:       cfg.ClientVersion,
 	}
+
+	// Wire the resource limiter, the process group, the live CPU grant and
+	// the live memory ceiling into the registered runtimes (BG-16, TB-75,
+	// TB-79).
+	d.wireRuntimeLimits(pg, limiter)
+	yieldMonitor.SetSampler(runtime.NewCPULoadSampler(runtime.NewMachineCPUSampler(), d.ownCPUSeconds, goruntime.NumCPU(), nil))
+	return d
+}
+
+// Notices returns the daemon's volunteer-facing notice ring.
+func (d *Daemon) Notices() *NoticeLog {
+	return d.notices
+}
+
+// HeadStatus returns the per-head version and update-required tracker.
+func (d *Daemon) HeadStatus() *HeadStatusTracker {
+	return d.headStatus
+}
+
+// ClientVersion returns this build's version string as configured at start-up.
+func (d *Daemon) ClientVersion() string {
+	return d.clientVersion
 }
 
 // Run starts the coordinator loop. It blocks until ctx is cancelled or Stop() is called.
@@ -444,6 +567,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.runCancel = nil
 		d.mu.Unlock()
 	}()
+
+	// A container runtime built before the daemon existed (start-up) may have
+	// had its memory budget clipped to the engine's VM; start-up lowered the
+	// advertisement it registered with, and the volunteer is told here (TB-63).
+	// The CPU budget likewise (TB-75).
+	d.refreshContainerMemoryNotice()
+	d.refreshContainerCPUNotice()
 
 	maxSlots := d.cfg.MaxConcurrentTasks
 	if maxSlots <= 0 {
@@ -499,6 +629,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// maxDepth is only a safety ceiling on descriptor count, so it is set well
 	// above the hours target to avoid being the binding constraint.
 	d.slotManager = NewSlotManager(maxSlots, d.logger)
+	d.slotManager.SetCPUShareSource(d.currentCPUShare)
 	d.prefetchQueue = NewPreFetchQueue(workBufferQueueDepth, d.logger)
 
 	// Start resource monitor goroutine.
@@ -514,6 +645,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 		defer d.thermalMonitor.Stop()
 	}
 
+	// Start the yield monitor (TB-83); a no-op unless yield.enabled.
+	if d.yieldMonitor != nil {
+		d.yieldMonitor.Start(monitorCtx)
+		defer d.yieldMonitor.Stop()
+	}
+
 	// Resume any tasks preserved from the previous daemon session: first the running
 	// tasks (back into slots), then the buffered prefetch units (back into the queue),
 	// so the volunteer reports its full held set on its first request and the head
@@ -526,15 +663,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// is exactly the active slots' + restored buffer's work dirs at this point.
 	d.gcOrphanedWorkDirs()
 
-	// Reclaim container-image disk left by a previous session, in two ordered steps.
-	// MUST run after the resumers (so a just-resumed unit is in the owned set and its
-	// freshly-created container is spared) and off the startup path. First remove this
-	// volunteer's own stranded work-unit containers (crash/dirty-shutdown leftovers) —
-	// they pin the leaf image, so the non-force image reaper cannot reclaim it — THEN
-	// sweep superseded cached images now that they are unpinned. Without this, a stale
-	// image left while the wanted image is already cached lingers indefinitely, since
-	// the per-pull reaper only fires on a fresh pull (confirmed in the field on
-	// v0.8.11/v0.8.12). Best-effort; never blocks startup.
+	// Reclaim container-image disk and memory left by a previous session, in two
+	// ordered steps. MUST run after the resumers (so a just-resumed unit is in the
+	// owned set and its freshly-created — or adopted, TB-74 — container is spared)
+	// and off the startup path. First remove this volunteer's own stranded work-unit
+	// containers in any state (crash/dirty-shutdown leftovers, and the paused
+	// container of a quit whose unit could not be adopted — still holding its
+	// memory) — they pin the leaf image, so the non-force image reaper cannot
+	// reclaim it — THEN sweep superseded cached images now that they are unpinned.
+	// Without this, a stale image left while the wanted image is already cached
+	// lingers indefinitely, since the per-pull reaper only fires on a fresh pull
+	// (confirmed in the field on v0.8.11/v0.8.12). Best-effort; never blocks startup.
 	if cr, ok := d.runtimeRegistry.GetRuntime("container").(*runtime.ContainerRuntime); ok && cr != nil {
 		owned := d.ownedWorkUnitIDs()
 		go func() {
@@ -568,6 +707,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// out. This goroutine keeps running across pauses and outlives every fetcher
 	// restart.
 	go d.runBufferMaintenance(ctx)
+
+	// Late container-engine detection (TB-59): while no container runtime is
+	// registered and a head is trusted for one, keep probing for an engine so
+	// one that comes up after the daemon is put to work without a restart.
+	go d.runContainerRedetect(ctx)
 
 	// Coordinator cleanup on exit.
 	defer func() {
@@ -669,7 +813,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// Suspend all running processes (freeze in place).
 			d.slotManager.SuspendAll()
 			d.logger.Info("suspended all active processes",
-				"reason", d.pauseReason,
+				"reason", d.PauseReason(),
 				"active_slots", d.slotManager.ActiveCount(),
 			)
 
@@ -743,19 +887,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// New item in queue — try to fill slots.
 			d.fillSlots(ctx)
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -770,6 +906,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wu := result.WU
 	conn := result.Conn
+
+	// The slot is already inactive: the survivors share the CPU budget among
+	// fewer tasks from now on (TB-75).
+	d.rebalanceCPUShares()
 
 	if result.Err != nil {
 		if errors.Is(result.Err, context.Canceled) {
@@ -795,6 +935,24 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 			)
 			return
 		}
+		if runtime.IsEngineUnreachable(result.Err) {
+			// The container engine stopped answering under this unit (a create
+			// or start that the socket refused, a wait the engine dropped). That
+			// is a RUNTIME outage, not this leaf failing on this machine: the
+			// unit is abandoned with the engine named as the reason — it was
+			// run-started, so the head bills the copy as any started abandon —
+			// but the leaf breaker does not count it, and the runtime is taken
+			// out of service and re-probed until the engine answers (TB-80).
+			// Before this the notice read "leaf keeps failing on this machine".
+			d.logger.Warn("slot execution failed because the container engine stopped answering; the unit is returned and container work is paused until the engine answers again",
+				"work_unit_id", wu.ID,
+				"slot", result.SlotID,
+				"error", result.Err,
+			)
+			d.abandonUnit(wu, conn, result.Err.Error())
+			d.NoteContainerEngineUnreachable(result.Runtime, result.Err)
+			return
+		}
 		d.logger.Error("slot execution failed",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
@@ -813,6 +971,9 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 
 	if result.Result.ExitCode != 0 {
 		reason := fmt.Sprintf("non-zero exit code %d", result.Result.ExitCode)
+		if note := d.containerKillNote(wu, result.Result.ExitCode); note != "" {
+			reason += " (" + note + ")"
+		}
 		d.logger.Error("slot execution non-zero exit",
 			"work_unit_id", wu.ID,
 			"slot", result.SlotID,
@@ -834,11 +995,19 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	// nothing about whether the artifact runs here.
 	d.noteLeafSuccess(wu)
 
-	// Persist result JSON for replay if the leaf has a viz bundle.
+	// Persist result JSON for replay if the leaf has a viz bundle. The bundle
+	// the runtime extracted into the work directory is already gone (the slot
+	// removed the work directory on completion), so SaveResult re-extracts a
+	// persistent copy from the cached tarball, identified by the spec's URL
+	// and checksum.
 	if result.VizBundlePath != "" && len(result.Result.OutputData) > 0 {
 		leafName, leafSlug := d.resolveLeafInfo(wu.LeafID)
 		maxBytes := int64(d.cfg.ResultCacheMaxMB) * 1024 * 1024
-		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, result.VizBundlePath, maxBytes); err != nil {
+		viz := VizBundleSource{
+			URL:      wu.ExecutionSpec.Binaries["viz"],
+			Checksum: strings.ToLower(wu.ExecutionSpec.BinaryChecksums["viz"]),
+		}
+		if err := SaveResult(d.cfg.DataDir, wu.ID, leafName, leafSlug, conn.Name, result.Result.OutputData, viz, maxBytes); err != nil {
 			d.logger.Warn("failed to persist result for replay",
 				"work_unit_id", wu.ID,
 				"error", err,
@@ -877,26 +1046,29 @@ func (d *Daemon) handleSlotResult(ctx context.Context, result SlotResult) {
 	wallClock := result.Result.Metrics.WallClockSeconds
 	active := activeSeconds(wallClock, result.TotalPausedDur)
 
-	// Update duration correction factor from actual vs estimated time.
+	// Record the unit's duration for this leaf's estimate (TB-58).
 	//
 	// This must use the ACTIVE duration, not the raw wall clock (TB-18). The
-	// factor scales every future estimate for this leaf, ramps up aggressively
-	// (80/20) while decaying at 10% per unit, and is persisted to dcf.json — so a
-	// single unit that happened to be suspended mid-run poisoned the estimate for
-	// days across restarts, and the client throttled its own work intake in
-	// response. Observed: a unit reporting 10212 s wall clock for ~1400 s of
-	// computation after a 2 h 28 min thermal freeze, against a normal range of
-	// 146–2821 s for that leaf on that host.
+	// figure scales every future estimate for this leaf and is persisted to
+	// durations.json — so a single unit that happened to be suspended mid-run
+	// once poisoned the estimate for days across restarts, and the client
+	// throttled its own work intake in response. Observed: a unit reporting
+	// 10212 s wall clock for ~1400 s of computation after a 2 h 28 min thermal
+	// freeze, against a normal range of 146–2821 s for that leaf on that host.
 	//
 	// Elapsed rather than CPU time is deliberate and stays: competing load from
 	// the volunteer's own other work genuinely does make a unit take longer here,
 	// and the estimate should reflect that. Suspension is the opposite case —
 	// time the unit was not running at all.
-	if d.dcfTracker != nil && wu.RscFpopsEst > 0 && d.benchmarkFPOPS > 0 {
-		estimatedSec := wu.RscFpopsEst / d.benchmarkFPOPS
-		if active > 0 {
-			d.dcfTracker.Update(wu.LeafID, estimatedSec, float64(active))
-		}
+	if d.durations != nil && active > 0 {
+		d.durations.Record(wu.LeafID, wu.RscFpopsEst, float64(active))
+		d.logger.Debug("unit duration recorded for the leaf's estimate",
+			"work_unit_id", wu.ID,
+			"leaf_id", wu.LeafID,
+			"active_seconds", active,
+			"completions_held", d.durations.Completions(wu.LeafID),
+			"estimate_seconds", d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst),
+		)
 	}
 
 	d.recordHistory(wu, wallClock, active, submitResp.Accepted, conn.Name)
@@ -1101,6 +1273,10 @@ func (d *Daemon) fillSlots(ctx context.Context) {
 			}
 		} else {
 			d.persistActiveTasks()
+			// One more task shares the CPU budget: shrink the others' shares
+			// to the new equal split (TB-75). The newcomer reads the same
+			// split when its runtime starts it.
+			d.rebalanceCPUShares()
 		}
 		// End the handoff only now: on success the active slot carries the unit
 		// (set before StartSlot returned), on failure it was abandoned to the
@@ -1139,8 +1315,19 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 	// BG-16: book this WU at BookedMemMB — the same clamped number the runtime will
 	// enforce — so admission and enforcement share one denominator. A declared 0 is
 	// bounded to the per-task default; a huge declaration is clamped to the budget.
-	maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB
+	// The budget is the configured one clipped to the container engine's VM where
+	// there is one (MemoryBudgetMB, TB-63) — the same figure the heads are told.
+	maxMemoryMB := d.MemoryBudgetMB()
 	wuMemoryMB := runtime.BookedMemMB(int(wu.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
+
+	// 0. The declaration itself. A unit that declares more than the budget is
+	// never started clamped below what its leaf asked for (TB-79): the head
+	// handed it out against a stale advertisement (a limit lowered since, a
+	// VM clip it has not been told yet), and the buffer sweep gives such a
+	// unit back un-run. This guard keeps admission honest in the meantime.
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return false, why
+	}
 
 	// 1. Configured memory budget.
 	if maxMemoryMB > 0 {
@@ -1161,10 +1348,7 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 
 	// 3. GPU exclusivity: one GPU work unit per physical GPU.
 	if wu.ExecutionSpec.GPURequired {
-		gpuCount := 0
-		if d.cachedHW != nil {
-			gpuCount = len(d.cachedHW.GetGpus())
-		}
+		gpuCount := len(d.advertisedHardware().GetGpus())
 		if gpuCount > 0 && d.slotManager.ActiveGPUCount() >= gpuCount {
 			return false, fmt.Sprintf("all GPUs busy: %d of %d running GPU work units",
 				d.slotManager.ActiveGPUCount(), gpuCount)
@@ -1177,6 +1361,21 @@ func (d *Daemon) canAccommodateWU(wu *runtime.WorkUnit) (bool, string) {
 		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, wuDiskMB+DiskFloorMB); err != nil {
 			return false, fmt.Sprintf("disk workspace: unit's /work ceiling is %d MB + %d MB floor, but: %v",
 				wuDiskMB, DiskFloorMB, err)
+		}
+	}
+
+	// 5. Configured CPU budget (TB-75): the cores booked by the running tasks
+	// plus this unit's must stay within max_cpu_cores (clipped to the engine
+	// VM's CPUs). Each unit books its leaf's minimum core requirement, floor
+	// 1, so the equal share the running tasks are given never drops below
+	// what a leaf declared it needs — and at most budget tasks run at once,
+	// whatever max_concurrent_tasks allows.
+	if budget := d.CPUBudgetCores(); budget > 0 {
+		wuCores := d.bookedCPUCores(wu)
+		activeCores := d.slotManager.TotalActiveCPUCores(d.bookedCPUCores)
+		if activeCores+wuCores > budget {
+			return false, fmt.Sprintf("configured CPU budget: %d core(s) booked by running tasks + %d for this unit exceeds max_cpu_cores %d",
+				activeCores, wuCores, budget)
 		}
 	}
 
@@ -1201,7 +1400,7 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 	}
 
 	// Configured memory budget: harmless iff both bookings fit it together.
-	if maxMemoryMB := d.cfg.ResourceLimits.MaxMemoryMB; maxMemoryMB > 0 {
+	if maxMemoryMB := d.MemoryBudgetMB(); maxMemoryMB > 0 {
 		blockedMemMB := runtime.BookedMemMB(int(blocked.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 		candMemMB := runtime.BookedMemMB(int(candidate.ExecutionSpec.MaxMemoryMB), maxMemoryMB)
 		if blockedMemMB+candMemMB > maxMemoryMB {
@@ -1211,10 +1410,7 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 
 	// GPU exclusivity: two GPU units co-run only when two physical GPUs exist.
 	if blocked.ExecutionSpec.GPURequired && candidate.ExecutionSpec.GPURequired {
-		gpuCount := 0
-		if d.cachedHW != nil {
-			gpuCount = len(d.cachedHW.GetGpus())
-		}
+		gpuCount := len(d.advertisedHardware().GetGpus())
 		if gpuCount < 2 {
 			return true
 		}
@@ -1228,6 +1424,13 @@ func (d *Daemon) mayDelayAdmission(blocked, candidate *runtime.WorkUnit) bool {
 		blockedDiskMB := runtime.BookedDiskMB(int(blocked.ExecutionSpec.MaxDiskMB), maxDiskMB)
 		candDiskMB := runtime.BookedDiskMB(int(candidate.ExecutionSpec.MaxDiskMB), maxDiskMB)
 		if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, blockedDiskMB+candDiskMB+DiskFloorMB); err != nil {
+			return true
+		}
+	}
+
+	// Configured CPU budget (TB-75): harmless iff both bookings fit it together.
+	if budget := d.CPUBudgetCores(); budget > 0 {
+		if d.bookedCPUCores(blocked)+d.bookedCPUCores(candidate) > budget {
 			return true
 		}
 	}
@@ -1254,6 +1457,14 @@ func (d *Daemon) itemMayDelay(blocked, candidate *PreFetchItem) bool {
 // is each leaf's own declared need, never the whole max_disk_gb allowance; see
 // disk_gate.go). Which specific leafs are fetchable is the fetcher's per-leaf
 // skip, driven by the same leafDiskGate.
+//
+// Every call sweeps the gate of EVERY fetchable leaf — not just until the
+// first one passes — and keeps one notice and one WARN per gated leaf current
+// (noteLeafDiskGated / noteLeafDiskGatePassed). With mixed leafs the machine
+// keeps fetching, so the answer here stays true, and the gated leaf used to be
+// the one surface a volunteer never heard about: a tester lost a night of his
+// biggest leaf's work to a gate that only the per-leaf API verdict mentioned,
+// with nothing above Debug in the log and nothing in the notice ring (TB-70).
 func (d *Daemon) shouldFetch() bool {
 	// Check scheduler.
 	if d.scheduler != nil && !d.scheduler.ShouldRun() {
@@ -1267,18 +1478,20 @@ func (d *Daemon) shouldFetch() bool {
 
 	// The absolute floor: below this nothing runs at all.
 	if err := d.limiter.CheckDiskSpace(d.cfg.DataDir, DiskFloorMB); err != nil {
-		d.warnDiskGateOnce(fmt.Sprintf("free space on the data dir (%s) is below the %d MB floor the fetch gate needs to run any work: %v",
-			d.cfg.DataDir, DiskFloorMB, err))
+		d.stallDiskGateDaemonWide(fmt.Sprintf("free space on the data dir (%s) is below the %d MB floor the fetch gate needs to run any work: %v",
+			d.cfg.DataDir, DiskFloorMB, err), 0)
 		return false
 	}
 
-	leafs := d.allEnabledLeafs()
+	leafs := d.enabledLeafsByHead()
 	if len(leafs) == 0 {
 		// No cached leaf catalog (e.g. a head that doesn't surface GetHeadInfo):
 		// gate the any-leaf request on the unknown-need fallback, since the
-		// leaf's real requirement is unknowable here.
+		// leaf's real requirement is unknowable here. No leaf is enabled, so no
+		// leaf is blocked by its own gate any more either.
+		d.resolveLeafDiskGatesExcept(nil)
 		if ok, reason := d.leafDiskGate(anyLeafInfo); !ok {
-			d.warnDiskGateOnce(reason)
+			d.stallDiskGateDaemonWide(reason, d.leafRaiseToGB(anyLeafInfo))
 			return false
 		}
 		d.clearDiskGateWarning()
@@ -1286,8 +1499,10 @@ func (d *Daemon) shouldFetch() bool {
 	}
 
 	var gatedLabel, gatedReason string
-	sawFetchable := false
-	for _, leaf := range leafs {
+	sawFetchable, anyPasses := false, false
+	swept := make(map[string]bool, len(leafs))
+	for _, hl := range leafs {
+		leaf := hl.leaf
 		// A leaf that requires a GPU this machine does not offer is refused by
 		// the head whatever its disk verdict, so it neither justifies fetching
 		// nor supplies the representative disk reason — a disk remedy quoted
@@ -1296,19 +1511,22 @@ func (d *Daemon) shouldFetch() bool {
 			continue
 		}
 		sawFetchable = true
+		swept[leaf.ID] = true
 		ok, reason := d.leafDiskGate(leaf)
 		if ok {
-			d.clearDiskGateWarning()
-			return true
+			anyPasses = true
+			d.noteLeafDiskGatePassed(leaf)
+			continue
 		}
+		d.noteLeafDiskGated(hl.head, leaf, reason)
 		if gatedLabel == "" {
-			gatedLabel = leaf.Slug
-			if gatedLabel == "" {
-				gatedLabel = leaf.ID
-			}
+			gatedLabel = leafLabel(leaf)
 			gatedReason = reason
 		}
 	}
+	// A leaf that left the sweep — disabled by the volunteer, retired by its
+	// head, or newly GPU-impossible — is no longer held back by its disk gate.
+	d.resolveLeafDiskGatesExcept(swept)
 	if !sawFetchable {
 		// Every enabled leaf needs a GPU this machine does not offer — a
 		// permanent capability mismatch, not a disk stall. `leafs list` and
@@ -1316,15 +1534,38 @@ func (d *Daemon) shouldFetch() bool {
 		d.logger.Debug("shouldFetch: every enabled leaf requires a GPU this machine does not offer")
 		return false
 	}
-	// Every fetchable leaf is disk-gated; surface one representative reason,
-	// naming its leaf — an unnamed "this leaf" sent a tester hunting through
-	// the catalog for which leaf the numbers belonged to (TB-30).
+	if anyPasses {
+		d.clearDiskGateWarning()
+		return true
+	}
+	// Every fetchable leaf is disk-gated. Each carries its own notice from the
+	// sweep above; this is the log's one machine-wide WARN — the volunteer is
+	// idle, not merely narrowed — naming a representative leaf (an unnamed
+	// "this leaf" sent a tester hunting through the catalog for which leaf the
+	// numbers belonged to, TB-30).
 	d.warnDiskGateOnce(fmt.Sprintf("every enabled leaf is disk-gated — e.g. %s: %s", gatedLabel, gatedReason))
 	return false
 }
 
-// leafNeedsAbsentGPU reports whether this leaf requires a GPU (either of the
-// two gpu_required flags — dispatch ORs them, TB-21) on a machine that
+// leafLabel is the name a log line or notice calls a leaf by: its slug, or
+// its id for a leaf the head gave no slug.
+func leafLabel(leaf CachedLeafInfo) string {
+	if leaf.Slug != "" {
+		return leaf.Slug
+	}
+	return leaf.ID
+}
+
+// leafRequiresGPU reports whether this leaf's units need a GPU: either of the
+// two gpu_required flags, because dispatch ORs them (TB-21).
+func leafRequiresGPU(leaf CachedLeafInfo) bool {
+	if leaf.ExecutionSpec != nil && leaf.ExecutionSpec.GPURequired {
+		return true
+	}
+	return leaf.ResourceRequirements != nil && leaf.ResourceRequirements.GPURequired
+}
+
+// leafNeedsAbsentGPU reports whether this leaf requires a GPU on a machine that
 // advertises none. Presence-only deliberately: VRAM, vendor and compute
 // capability shortfalls stay the head's call, so this can never skip a leaf
 // the head would actually dispatch.
@@ -1332,20 +1573,78 @@ func (d *Daemon) leafNeedsAbsentGPU(leaf CachedLeafInfo) bool {
 	if d.HasGPU() {
 		return false
 	}
-	if leaf.ExecutionSpec != nil && leaf.ExecutionSpec.GPURequired {
-		return true
+	return leafRequiresGPU(leaf)
+}
+
+// leafRuntimeVerdict classifies a leaf against what this machine advertised to
+// one head, mirroring the head's own dispatch gate: a leaf's runtime must be
+// among the runtimes the volunteer advertised to that head, and what it
+// advertises is the registered runtimes filtered by per-head trust
+// (advertisedForServer). It returns the runtime the leaf needs — "container",
+// "native", or "" for a leaf that is never refused on runtime grounds (a WASM-
+// capable leaf, since WASM is always registered and always trusted, or a leaf
+// with no published spec, where the per-unit gates decide) — plus whether that
+// runtime is missing from this machine's registry and whether the head is
+// untrusted for it. A container leaf needs a registered container runtime and
+// per-head CONTAINER trust; a native-only leaf (native binaries, no wasm) needs
+// per-head NATIVE trust (a trusted head implies the runtime is registered —
+// buildRuntimeRegistry constructs native when any head is trusted for it). A
+// nil registry reports nothing missing. Shared by the readiness banner
+// (readinessCounts, PB-5) and the fetcher's pre-request skip (TB-49), so the two
+// cannot disagree about which leafs this machine can be handed.
+func leafRuntimeVerdict(leaf CachedLeafInfo, registry *RuntimeRegistry, srv config.ServerConfig) (rt string, missing, untrusted bool) {
+	es := leaf.ExecutionSpec
+	if es == nil {
+		return "", false, false
 	}
-	return leaf.ResourceRequirements != nil && leaf.ResourceRequirements.GPURequired
+	if es.Image != "" {
+		rt = "container"
+	} else {
+		wasmCapable, nativeCapable := false, false
+		for k := range es.Binaries {
+			if strings.EqualFold(k, "wasm") {
+				wasmCapable = true
+			} else {
+				nativeCapable = true
+			}
+		}
+		if !nativeCapable || wasmCapable {
+			return "", false, false
+		}
+		rt = "native"
+	}
+	missing = registry != nil && registry.GetRuntime(rt) == nil
+	untrusted = !srv.TrustsRuntime(rt)
+	return rt, missing, untrusted
+}
+
+// headLeaf is an enabled leaf together with the name of the head it is
+// enabled on, for the log lines and notices that name both.
+type headLeaf struct {
+	head string
+	leaf CachedLeafInfo
+}
+
+// enabledLeafsByHead returns the enabled leafs across every attached head,
+// each paired with its head's name.
+func (d *Daemon) enabledLeafsByHead() []headLeaf {
+	if d.multiClient == nil {
+		return nil
+	}
+	var out []headLeaf
+	for _, srv := range d.multiClient.Servers() {
+		for _, leaf := range d.enabledLeafs(srv.Name) {
+			out = append(out, headLeaf{head: srv.Name, leaf: leaf})
+		}
+	}
+	return out
 }
 
 // allEnabledLeafs returns the enabled leafs across every attached head.
 func (d *Daemon) allEnabledLeafs() []CachedLeafInfo {
-	if d.multiClient == nil {
-		return nil
-	}
 	var out []CachedLeafInfo
-	for _, srv := range d.multiClient.Servers() {
-		out = append(out, d.enabledLeafs(srv.Name)...)
+	for _, hl := range d.enabledLeafsByHead() {
+		out = append(out, hl.leaf)
 	}
 	return out
 }
@@ -1393,73 +1692,74 @@ func (d *Daemon) maxSlots() int {
 }
 
 // estSecondsForUnit estimates wall-clock seconds for a unit from its FP-ops
-// estimate and this host's benchmark, applying the leaf's learned duration
-// correction factor when available. Returns 0 when no estimate is possible.
+// estimate: at the leaf's learned seconds per FP-op once the leaf has completed
+// on this machine (TB-58), else against this host's CPU benchmark. Returns 0
+// when no estimate is possible — no FP-ops figure, or no benchmark before the
+// leaf's first completion here.
 func (d *Daemon) estSecondsForUnit(leafID string, rscFpopsEst float64) float64 {
-	if rscFpopsEst <= 0 || d.benchmarkFPOPS <= 0 {
+	if rscFpopsEst <= 0 {
 		return 0
 	}
-	sec := rscFpopsEst / d.benchmarkFPOPS
-	if d.dcfTracker != nil {
-		if dcf := d.dcfTracker.Get(leafID); dcf > 0 {
-			sec *= dcf
+	if d.durations != nil {
+		if rate, ok := d.durations.SecondsPerFpop(leafID); ok {
+			return rscFpopsEst * rate
 		}
 	}
-	return sec
+	if d.benchmarkFPOPS <= 0 {
+		return 0
+	}
+	return rscFpopsEst / d.benchmarkFPOPS
 }
 
 // leafEstSeconds estimates wall-clock seconds for one unit of a leaf to size the
 // FIRST batch request to it (#29), BEFORE any of that leaf's units have been
 // buffered (so estSecondsForUnit, which needs a per-unit rsc_fpops_est, can't
-// help yet). It uses the leaf-level, benchmark-INDEPENDENT estimate the head
-// carries on CachedLeafInfo, refined by this leaf's learned duration correction
-// factor when one is available. Because it does not divide by the local
-// benchmark, it stays non-zero on un-benchmarked hosts — the exact case the old
-// FP-ops-only seam tripped to 0, leaving the flat ceiling to bind. Returns 0 only
-// when the head supplied no estimate.
+// help yet). Once the leaf has completed on this machine it is the median of
+// those completions (TB-58); until then it is the leaf-level, benchmark-
+// INDEPENDENT estimate the head carries on CachedLeafInfo. Neither divides by
+// the local benchmark, so it stays non-zero on un-benchmarked hosts — the exact
+// case the old FP-ops-only seam tripped to 0, leaving the flat ceiling to bind.
+// Returns 0 only when the head supplied no estimate and nothing has been learned.
 func (d *Daemon) leafEstSeconds(leaf CachedLeafInfo) float64 {
 	sec := leaf.EstimatedDurationSeconds
-	if sec > 0 && d.dcfTracker != nil {
-		if dcf := d.dcfTracker.Get(leaf.ID); dcf > 0 {
-			sec *= dcf
+	if d.durations != nil {
+		if learned, ok := d.durations.UnitSeconds(leaf.ID); ok {
+			sec = learned
 		}
 	}
-	// TB-34: fold in what the last ARRIVED batch of this leaf actually measured
-	// (per-unit FP-ops against this host's benchmark). Taking the max corrects the
-	// over-ask case — a leaf-level estimate far below the units' real size asked for
-	// 60× what the buffer could hold, and the DCF never corrects it because it learns
-	// only from completions, which the returned tail never produces. When the head's
-	// figure is the larger one it still wins (smaller asks are the safe direction).
+	// TB-34: fold in what the last ARRIVED unit of this leaf implies under the
+	// current per-unit estimate. Taking the max corrects the over-ask case — a
+	// leaf-level estimate far below the units' real size asked for 60× what the
+	// buffer could hold, and completions never correct it because the returned
+	// tail never produces any. When the leaf-level figure is the larger one it
+	// still wins (smaller asks are the safe direction).
 	d.arrivalEstMu.Lock()
-	if arr := d.arrivalEstSec[leaf.ID]; arr > sec {
+	fpops := d.arrivalFpopsEst[leaf.ID]
+	d.arrivalEstMu.Unlock()
+	if arr := d.estSecondsForUnit(leaf.ID, fpops); arr > sec {
 		sec = arr
 	}
-	d.arrivalEstMu.Unlock()
 	if sec <= 0 {
 		return 0
 	}
 	return sec
 }
 
-// noteArrivalEstimate records the per-unit seconds a just-arrived unit of the leaf
-// implies (its rsc_fpops_est against this host's benchmark, DCF applied — see
-// arrivalEstSec). Called by the fetcher per arrival; a unit with no usable estimate
-// records nothing (the previous figure stands). Units of one leaf are near-uniform,
-// so the latest observation is the batch signal with no windowing machinery.
+// noteArrivalEstimate records the FP-ops estimate of a just-arrived unit of the
+// leaf (see arrivalFpopsEst). Called by the fetcher per arrival; a unit with no
+// FP-ops figure records nothing (the previous figure stands). Units of one leaf
+// are near-uniform, so the latest observation is the batch signal with no
+// windowing machinery.
 func (d *Daemon) noteArrivalEstimate(leafID string, rscFpopsEst float64) {
-	if leafID == "" {
-		return
-	}
-	sec := d.estSecondsForUnit(leafID, rscFpopsEst)
-	if sec <= 0 {
+	if leafID == "" || rscFpopsEst <= 0 {
 		return
 	}
 	d.arrivalEstMu.Lock()
-	if d.arrivalEstSec == nil {
+	if d.arrivalFpopsEst == nil {
 		// Lazy init: test daemons are built as struct literals without the constructor.
-		d.arrivalEstSec = make(map[string]float64)
+		d.arrivalFpopsEst = make(map[string]float64)
 	}
-	d.arrivalEstSec[leafID] = sec
+	d.arrivalFpopsEst[leafID] = rscFpopsEst
 	d.arrivalEstMu.Unlock()
 }
 
@@ -1476,6 +1776,100 @@ func (d *Daemon) bufferTargetSeconds() float64 {
 		return 0
 	}
 	return hours * 3600 * float64(d.maxSlots())
+}
+
+// gpuSlots is how many execution slots GPU-required units can occupy at once:
+// one per physical GPU (canAccommodateWU's exclusivity guard), never more than
+// the slot count. With no GPU detected there is no GPU-specific bound — the
+// head should not be dispatching GPU work here at all (leafNeedsAbsentGPU) —
+// so the slot count is returned and the GPU class collapses into the whole.
+func (d *Daemon) gpuSlots() int {
+	slots := d.maxSlots()
+	if n := len(d.advertisedHardware().GetGpus()); n > 0 && n < slots {
+		return n
+	}
+	return slots
+}
+
+// gpuBufferTargetSeconds is the hours target for the GPU class of buffered work:
+// work_buffer_hours per GPU-capable slot (TB-48). The global target sizes the
+// buffer by slots alone, but GPU-required units can only ever drain through
+// gpuSlots of them, so on a one-GPU host with many CPU slots the global figure
+// let the buffer hold slots × hours of GPU units of which one ran, the rest
+// waiting until the 90 %-of-deadline drop. GPU units count against BOTH this
+// and the global target (they occupy slots too); everything else counts against
+// the global target only. Returns 0 when buffering is disabled (hours == 0).
+func (d *Daemon) gpuBufferTargetSeconds() float64 {
+	hours := d.cfg.WorkBufferHours
+	if hours <= 0 {
+		return 0
+	}
+	return hours * 3600 * float64(d.gpuSlots())
+}
+
+// bufferedGPUSeconds is bufferedSeconds restricted to GPU-required units —
+// the fill measured against gpuBufferTargetSeconds. Same full-booking
+// (conservative, acceptance-side) view as bufferedSeconds.
+func (d *Daemon) bufferedGPUSeconds() float64 {
+	var total float64
+	for _, wu := range d.heldWorkUnits() {
+		if wu.ExecutionSpec.GPURequired {
+			total += d.estSecondsForUnit(wu.LeafID, wu.RscFpopsEst)
+		}
+	}
+	return total
+}
+
+// bufferedGPUUnitCount counts held GPU-required units (the unit-count fallback
+// view of the GPU class).
+func (d *Daemon) bufferedGPUUnitCount() int {
+	n := 0
+	for _, wu := range d.heldWorkUnits() {
+		if wu.ExecutionSpec.GPURequired {
+			n++
+		}
+	}
+	return n
+}
+
+// fallbackGPUBufferUnits is the GPU class's unit-count cap when no hours
+// estimate is available: the same per-slot multiple as fallbackBufferUnits,
+// over GPU-capable slots.
+func (d *Daemon) fallbackGPUBufferUnits() int {
+	return fallbackBufferUnitsPerSlot * d.gpuSlots()
+}
+
+// gpuBufferHoursFull is workBufferHoursFull for the GPU class (TB-48): the GPU
+// units held reach the GPU hours target, or — when none of them can be
+// estimated — the GPU unit-count fallback. Like its global counterpart it says
+// nothing about runnability; bufferAccepts and the fetcher's pre-request skip
+// apply it, and the TB-32 idle-slot escape still governs acceptance over it.
+func (d *Daemon) gpuBufferHoursFull() bool {
+	target := d.gpuBufferTargetSeconds()
+	if target <= 0 {
+		return d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits()
+	}
+	sec := d.bufferedGPUSeconds()
+	if sec <= 0 && d.bufferedGPUUnitCount() >= d.fallbackGPUBufferUnits() {
+		return true
+	}
+	return sec >= target
+}
+
+// leafClassBufferFull reports whether the resource class this leaf's units
+// belong to has already reached its own hours target, so the fetcher can skip
+// the leaf BEFORE issuing RequestWorkUnit (TB-48). Today the only class bounded
+// tighter than the slot count is GPU work; a CPU leaf is never class-full here
+// (the global target and workBufferFull govern it). Without this skip a one-GPU
+// host under its global target asked for GPU units every round and returned
+// each within seconds — the request-and-refuse churn TB-34 ended for the
+// global buffer.
+func (d *Daemon) leafClassBufferFull(leaf CachedLeafInfo) (bool, string) {
+	if !leafRequiresGPU(leaf) || !d.gpuBufferHoursFull() {
+		return false, ""
+	}
+	return true, fmt.Sprintf("GPU work buffer full (%.1f h of GPU units held against a target of %.1f h for %d GPU slot(s))",
+		d.bufferedGPUSeconds()/3600, d.gpuBufferTargetSeconds()/3600, d.gpuSlots())
 }
 
 // bufferedSeconds sums the estimated seconds of work currently held: queued,
@@ -1681,17 +2075,66 @@ func (d *Daemon) leafFitGate(leaf CachedLeafInfo) (bool, string) {
 // idle slot — and only if it can start now; anything else is returned to the
 // head immediately (abandon → instant re-dispatch) instead of being held for
 // hours and dropped. Refusal reasons travel to the head as the abandon reason.
+//
+// A GPU-required unit is also measured against the GPU class's own target
+// (gpuBufferHoursFull, TB-48): under the global target but over the GPU one it
+// is refused the same way, because only gpuSlots of the slots can ever drain it
+// — on a one-GPU host the global target admitted slots × hours of GPU units, of
+// which one ran and the rest waited for the deadline drop.
 func (d *Daemon) bufferAccepts(wu *runtime.WorkUnit) (bool, string) {
-	if !d.workBufferHoursFull() {
+	// A unit whose declaration the budget cannot cover is returned before
+	// any Prepare cost (TB-79): the head sent it against an advertisement
+	// this poll has already replaced, and it can only ever run here clamped
+	// below what its leaf asked for.
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return false, why
+	}
+	full, reason := d.workBufferHoursFull(), "work buffer full (over the hours target)"
+	if !full && wu.ExecutionSpec.GPURequired && d.gpuBufferHoursFull() {
+		full = true
+		reason = fmt.Sprintf("GPU work buffer full (over the hours target for %d GPU slot(s))", d.gpuSlots())
+	}
+	if !full {
 		return true, ""
 	}
 	if !d.idleSlotStarved() {
-		return false, "work buffer full (over the hours target)"
+		return false, reason
 	}
-	if ok, reason := d.canAccommodateWU(wu); !ok {
-		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", reason)
+	if ok, why := d.canAccommodateWU(wu); !ok {
+		return false, fmt.Sprintf("work buffer full and the unit cannot start in the idle slot (%s)", why)
 	}
 	return true, ""
+}
+
+// memoryDeclarationFits reports whether a unit's declared memory fits this
+// machine's live memory budget, with the reason when it does not — both
+// figures, so the head's ledger and the volunteer's log say why the unit was
+// returned (TB-79). A unit declaring nothing is bounded to the per-task
+// default and always fits; with no configured budget everything fits.
+func (d *Daemon) memoryDeclarationFits(wu *runtime.WorkUnit) (bool, string) {
+	if wu == nil {
+		return true, ""
+	}
+	declared, budget := int(wu.ExecutionSpec.MaxMemoryMB), d.MemoryBudgetMB()
+	if declared <= 0 || budget <= 0 || declared <= budget {
+		return true, ""
+	}
+	return false, fmt.Sprintf("unit declares %d MB but this machine's memory budget is %d MB; heads are told the budget and only send leafs that fit it", declared, budget)
+}
+
+// unfitBuffered is the fetcher's buffer-sweep hook (TB-79): the reason a
+// buffered unit can no longer run on this machine, or "".
+func (d *Daemon) unfitBuffered(wu *runtime.WorkUnit) string {
+	if ok, why := d.memoryDeclarationFits(wu); !ok {
+		return why
+	}
+	// A container unit buffered before its engine stopped answering would
+	// reach a slot only to be run-started and fail at create, billed; while
+	// the outage lasts it is returned un-run instead (TB-80).
+	if wu != nil && runtimeKeyForWU(wu) == runtime.RuntimeContainer && d.containerEngineDown() {
+		return "container engine unreachable"
+	}
+	return ""
 }
 
 // fallbackBufferUnits is the unit-count cap used when an hours estimate is
@@ -1718,13 +2161,25 @@ func (d *Daemon) bufferedUnitCount() int {
 // rsc_fpops_est — it falls back to averaging the seconds-per-unit of work already
 // buffered; failing that, it requests a full batch whenever the buffer is below
 // its hours target so batching still happens, and 1 otherwise.
-func (d *Daemon) requestBatchSize(estSecondsPerUnit float64) int32 {
+//
+// For a GPU-required leaf the deficit is the smaller of the global deficit and
+// the GPU class's own (gpuBufferTargetSeconds − bufferedGPUSeconds, TB-48), and
+// the no-estimate fallback is bounded by the GPU unit-count cap rather than a
+// full batch: a one-GPU host asking a head for 64 GPU units — the ask clamp the
+// head's logs showed every five minutes — can drain them only one at a time.
+func (d *Daemon) requestBatchSize(leaf CachedLeafInfo, estSecondsPerUnit float64) int32 {
 	target := d.bufferTargetSeconds()
 	if target <= 0 {
 		// Buffering disabled (hours == 0): unit-count fallback, one at a time.
 		return 1
 	}
 	deficit := target - d.bufferedSeconds()
+	gpu := leafRequiresGPU(leaf)
+	if gpu {
+		if gpuDeficit := d.gpuBufferTargetSeconds() - d.bufferedGPUSeconds(); gpuDeficit < deficit {
+			deficit = gpuDeficit
+		}
+	}
 	if deficit <= 0 {
 		return 1
 	}
@@ -1734,16 +2189,23 @@ func (d *Daemon) requestBatchSize(estSecondsPerUnit float64) int32 {
 		per = d.avgBufferedSecondsPerUnit()
 	}
 	if per <= 0 {
-		// No estimate at all: request a full batch to refill the deficit quickly.
+		// No estimate at all: request a full batch to refill the deficit quickly —
+		// except for the GPU class, whose unit-count fallback bounds the ask.
+		if gpu {
+			return clampBatch(int32(d.fallbackGPUBufferUnits() - d.bufferedGPUUnitCount()))
+		}
 		return maxBatchPerRequest
 	}
+	return clampBatch(int32(deficit / per))
+}
 
-	n := int32(deficit / per)
+// clampBatch bounds a computed ask to [1, maxBatchPerRequest].
+func clampBatch(n int32) int32 {
 	if n < 1 {
-		n = 1
+		return 1
 	}
 	if n > maxBatchPerRequest {
-		n = maxBatchPerRequest
+		return maxBatchPerRequest
 	}
 	return n
 }
@@ -1789,6 +2251,11 @@ func (d *Daemon) trackSlotStarvation() {
 	d.slotStarveMu.Lock()
 	defer d.slotStarveMu.Unlock()
 	if !starved {
+		if !d.slotStarveWarnedAt.IsZero() {
+			// The starvation this WARNed about has ended: a buffered unit
+			// started, or the buffer drained.
+			d.notices.Resolve("buffer_unrunnable", "", "")
+		}
 		d.slotStarvedSince = time.Time{}
 		d.slotStarveWarnedAt = time.Time{}
 		return
@@ -1811,18 +2278,30 @@ func (d *Daemon) trackSlotStarvation() {
 	if len(items) > 0 && items[0].WU != nil {
 		_, reason = d.canAccommodateWU(items[0].WU)
 	}
+	idleFor := now.Sub(d.slotStarvedSince).Round(time.Second).String()
 	d.logger.Warn("an execution slot is idle but none of the buffered work units can start on this machine — requesting admissible work from the attached heads, but none has served any",
-		"idle_for", now.Sub(d.slotStarvedSince).Round(time.Second).String(),
+		"idle_for", idleFor,
 		"buffered_units", len(items),
 		"head_of_buffer_reason", reason)
+	d.notices.Notify(NoticeWarn, "buffer_unrunnable",
+		fmt.Sprintf("An execution slot has been idle for %s: %d work unit(s) are buffered but none can start on this machine (%s). The daemon is asking the attached heads for work that fits, but none has served any yet.",
+			idleFor, len(items), reason),
+		"", "")
 }
 
-// warnDiskGateOnce surfaces the disk-space stall. The first time the gate
-// blocks all fetching it logs a single actionable WARN carrying the gate's own
-// reason (which names the numbers and the setting involved); subsequent blocked
-// polls stay at Debug so the log isn't spammed. clearDiskGateWarning resets it
-// so a later recovery and re-stall warns again.
-func (d *Daemon) warnDiskGateOnce(reason string) {
+// warnDiskGateOnce surfaces the machine-wide disk-space stall — nothing is
+// being fetched at all. The first time it logs a single actionable WARN
+// carrying the gate's own reason (which names the numbers and the setting
+// involved) and reports true; subsequent blocked polls stay at Debug so the
+// log isn't spammed. clearDiskGateWarning resets it so a later recovery and
+// re-stall warns again.
+//
+// The notice for the stall is the caller's. A stall no single leaf owns (the
+// absolute floor, the any-leaf fallback) raises a daemon-wide one through
+// stallDiskGateDaemonWide; when every leaf is gated, each leaf's own notice
+// from the shouldFetch sweep already says so, and a daemon-wide one on top
+// would show the same stall twice.
+func (d *Daemon) warnDiskGateOnce(reason string) bool {
 	d.diskGateMu.Lock()
 	already := d.diskGateWarned
 	d.diskGateWarned = true
@@ -1830,15 +2309,37 @@ func (d *Daemon) warnDiskGateOnce(reason string) {
 
 	if already {
 		d.logger.Debug("shouldFetch: still disk-gated", "reason", reason)
-		return
+		return false
 	}
 
 	d.logger.Warn("not fetching work: disk-gated — this volunteer stays idle until it clears",
 		"reason", reason,
 		"data_dir_free_mb", client.DiskAvailableMB(d.cfg.DataDir))
+	return true
 }
 
-// clearDiskGateWarning re-arms the disk-gate WARN after the gate clears.
+// stallDiskGateDaemonWide is warnDiskGateOnce for a stall that no single leaf
+// owns, plus its daemon-wide notice (no head, no leaf) the first time.
+// raiseToGB is the max_disk_gb that would cover the attached leafs on this
+// machine today (0 = not applicable); the notice must name the allowance that
+// clears it — a refusal that named no number sent a tester on a
+// raise-and-chase (TB-41).
+func (d *Daemon) stallDiskGateDaemonWide(reason string, raiseToGB int) {
+	if !d.warnDiskGateOnce(reason) {
+		return
+	}
+	msg := "Not fetching work: " + reason + "."
+	if raiseToGB > 0 {
+		msg += fmt.Sprintf(" The attached leafs would be covered by max_disk_gb = %d (currently %d).",
+			raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
+	}
+	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, "", "")
+}
+
+// clearDiskGateWarning re-arms the machine-wide disk-gate WARN once fetching
+// is possible again, and resolves the daemon-wide notice — that one only: the
+// floor recovering does not unblock a leaf whose own gate still refuses, so
+// its notice stays live until noteLeafDiskGatePassed ends it.
 func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Lock()
 	wasWarned := d.diskGateWarned
@@ -1846,42 +2347,96 @@ func (d *Daemon) clearDiskGateWarning() {
 	d.diskGateMu.Unlock()
 	if wasWarned {
 		d.logger.Info("disk space recovered: resuming work fetching")
+		d.notices.ResolveDaemonWide("disk_gate_blocked")
+	}
+}
+
+// noteLeafDiskGated records that this leaf's own disk gate refused in the
+// current shouldFetch sweep. The first refusal since the leaf last passed
+// logs one WARN and raises the leaf's own disk_gate_blocked notice — naming
+// the leaf, the gate's reason and the max_disk_gb that would cover it, the
+// figure the per-leaf API verdict shows (TB-41) — so a gate that blocks some
+// leafs while others keep fetching is as visible as one that blocks them all.
+// Later sweeps that still refuse stay silent; the fetcher's per-leaf skip
+// keeps the Debug trail (TB-70). noteLeafDiskGatePassed ends it.
+func (d *Daemon) noteLeafDiskGated(head string, leaf CachedLeafInfo, reason string) {
+	d.diskGateMu.Lock()
+	already := d.diskGatedLeafs[leaf.ID]
+	if d.diskGatedLeafs == nil {
+		d.diskGatedLeafs = make(map[string]bool)
+	}
+	d.diskGatedLeafs[leaf.ID] = true
+	d.diskGateMu.Unlock()
+	if already {
+		return
+	}
+
+	label := leafLabel(leaf)
+	raiseToGB := d.leafRaiseToGB(leaf)
+	d.logger.Warn("not fetching leaf: disk-gated — its units are skipped until the gate clears",
+		"server", head, "leaf_slug", label, "leaf_id", leaf.ID,
+		"reason", reason, "raise_to_gb", raiseToGB,
+		"data_dir_free_mb", client.DiskAvailableMB(d.cfg.DataDir))
+
+	msg := fmt.Sprintf("Not fetching leaf %q: %s.", label, reason)
+	if raiseToGB > 0 {
+		msg += fmt.Sprintf(" It would be covered by max_disk_gb = %d (currently %d).",
+			raiseToGB, d.cfg.ResourceLimits.MaxDiskGB)
+	}
+	d.notices.Notify(NoticeWarn, "disk_gate_blocked", msg, head, leaf.ID)
+}
+
+// noteLeafDiskGatePassed records that this leaf's own disk gate passed in the
+// current sweep; if it had been refusing, that is logged and its notice ends.
+func (d *Daemon) noteLeafDiskGatePassed(leaf CachedLeafInfo) {
+	d.diskGateMu.Lock()
+	was := d.diskGatedLeafs[leaf.ID]
+	delete(d.diskGatedLeafs, leaf.ID)
+	d.diskGateMu.Unlock()
+	if was {
+		d.logger.Info("disk gate cleared for leaf: resuming its fetching",
+			"leaf_slug", leafLabel(leaf), "leaf_id", leaf.ID)
+		d.notices.Resolve("disk_gate_blocked", "", leaf.ID)
+	}
+}
+
+// resolveLeafDiskGatesExcept ends the stall of every gated leaf the current
+// sweep did not visit — one no longer enabled here, or one the head would now
+// refuse regardless of disk — since its gate no longer keeps anything from
+// fetching. swept may be nil (the sweep visited nothing).
+func (d *Daemon) resolveLeafDiskGatesExcept(swept map[string]bool) {
+	d.diskGateMu.Lock()
+	var gone []string
+	for id := range d.diskGatedLeafs {
+		if !swept[id] {
+			gone = append(gone, id)
+			delete(d.diskGatedLeafs, id)
+		}
+	}
+	d.diskGateMu.Unlock()
+	for _, id := range gone {
+		d.logger.Info("disk-gated leaf is no longer enabled here: ending its stall", "leaf_id", id)
+		d.notices.Resolve("disk_gate_blocked", "", id)
 	}
 }
 
 // readinessCounts tallies, per attached head, how many enabled leafs this
 // volunteer can ACTUALLY receive and run — applying the same gates the fetcher
-// applies: a container leaf needs a registered container runtime AND per-head
-// CONTAINER trust; a native-only leaf needs per-head NATIVE trust (native code
-// is always machine-runnable, so trust is its only gate); WASM is always
-// trusted. Counting a leaf the per-head trust would refuse produced the
-// "eligible: 1" line for a volunteer that could never receive work (PB-5).
+// applies (leafRuntimeVerdict): a container leaf needs a registered container
+// runtime AND per-head CONTAINER trust; a native-only leaf needs per-head
+// NATIVE trust (native code is always machine-runnable, so trust is its only
+// gate); WASM is always trusted. Counting a leaf the per-head trust would
+// refuse produced the "eligible: 1" line for a volunteer that could never
+// receive work (PB-5).
 func (d *Daemon) readinessCounts() (total, eligible, containerBlocked, trustBlocked int) {
-	hasContainer := d.runtimeRegistry.GetRuntime("container") != nil
 	for _, srv := range d.multiClient.Servers() {
 		for _, lf := range d.enabledLeafs(srv.Name) {
 			total++
-			es := lf.ExecutionSpec
-			if es == nil {
-				// No spec info from the head: don't over-block on unknowns.
-				eligible++
-				continue
-			}
-			needsContainer := es.Image != ""
-			wasmCapable, nativeCapable := false, false
-			for k := range es.Binaries {
-				if strings.EqualFold(k, "wasm") {
-					wasmCapable = true
-				} else {
-					nativeCapable = true
-				}
-			}
+			rt, missing, untrusted := leafRuntimeVerdict(lf, d.runtimeRegistry, srv.Config)
 			switch {
-			case needsContainer && !hasContainer:
+			case rt == "container" && missing:
 				containerBlocked++
-			case needsContainer && !srv.Config.TrustsRuntime("CONTAINER"):
-				trustBlocked++
-			case !needsContainer && nativeCapable && !wasmCapable && !srv.Config.TrustsRuntime("NATIVE"):
+			case untrusted:
 				trustBlocked++
 			default:
 				eligible++
@@ -1920,18 +2475,13 @@ func (d *Daemon) logReadiness() {
 	)
 
 	// "Connected, but you will get no work" — the actionable case worth a WARN.
-	if totalLeafs > 0 && eligibleLeafs == 0 {
-		switch {
-		case containerBlocked == totalLeafs && !hasContainer:
-			d.logger.Warn("no runnable leafs: every attached leaf needs a container runtime, but none is available here — install Docker or Podman (see the volunteer setup docs), or attach a head that has native leafs",
-				"runtimes", runtimes, "container_leafs", containerBlocked)
-		case trustBlocked > 0:
-			d.logger.Warn("no runnable leafs: the attached leafs need runtimes this volunteer has not trusted their heads to run — opt in per head with 'lettuce-volunteer heads trust <head> <runtime>' if you accept running that head's code",
-				"runtimes", runtimes, "trust_blocked_leafs", trustBlocked, "total_leafs", totalLeafs)
-		default:
-			d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
-				"runtimes", runtimes, "total_leafs", totalLeafs)
-		}
+	// When every leaf is runtime-blocked the verdict, its WARN and its notice
+	// are owned by refreshRuntimeBlocked (TB-60), which the fetcher keeps
+	// current from here on and which resolves the notice the moment a runtime
+	// registers late (TB-59).
+	if totalLeafs > 0 && eligibleLeafs == 0 && !d.refreshRuntimeBlocked() {
+		d.logger.Warn("no runnable leafs: none of the attached leafs match this volunteer's available runtimes",
+			"runtimes", runtimes, "total_leafs", totalLeafs, "container_blocked_leafs", containerBlocked, "has_container_runtime", hasContainer)
 	}
 }
 
@@ -2087,6 +2637,17 @@ func (d *Daemon) noteLeafFailure(wu *runtime.WorkUnit, reason string) {
 		"last_reason", reason,
 		"cooldown", leafFailureCooldown,
 		"remedy", "this leaf's work fails locally every time, so requesting more of it only churns units; the daemon will retry it after the cooldown. Check the log lines above for the process output, and report it to the head's operator if it persists")
+	label := name
+	if label == "" {
+		label = slug
+	}
+	if label == "" {
+		label = wu.LeafID
+	}
+	d.notices.Notify(NoticeWarn, "leaf_failing",
+		fmt.Sprintf("Leaf %q keeps failing on this machine (%d consecutive failures; last reason: %s). Requests for it are paused for %s, then retried once. If it persists, report it to the head's operator.",
+			label, count, reason, leafFailureCooldown),
+		"", wu.LeafID)
 }
 
 // noteLeafSuccess clears a leaf's failure streak after a clean run, marking the
@@ -2099,6 +2660,7 @@ func (d *Daemon) noteLeafSuccess(wu *runtime.WorkUnit) {
 		name, slug := d.resolveLeafInfo(wu.LeafID)
 		d.logger.Info("leaf recovered, resuming requests for it",
 			"leaf_id", wu.LeafID, "leaf_name", name, "leaf_slug", slug)
+		d.notices.Resolve("leaf_failing", "", wu.LeafID)
 	}
 }
 
@@ -2120,7 +2682,7 @@ func (d *Daemon) HasGPU() bool {
 	if d.cfg != nil && d.cfg.ResourceLimits.MaxGPUVRAMPct == 0 {
 		return false
 	}
-	return d.cachedHW != nil && len(d.cachedHW.GetGpus()) > 0
+	return len(d.advertisedHardware().GetGpus()) > 0
 }
 
 // GPUBudget reports the GPU capabilities this daemon ADVERTISED to heads, in the
@@ -2140,7 +2702,7 @@ func (d *Daemon) GPUBudget() (vramMB, cardVRAMMB, vramPct int, vendors []string,
 	if !d.HasGPU() {
 		return 0, 0, 0, nil, nil
 	}
-	for _, g := range d.cachedHW.GetGpus() {
+	for _, g := range d.advertisedHardware().GetGpus() {
 		if eff := int(g.GetVramMb()) * int(g.GetMaxVramPct()) / 100; eff > vramMB {
 			vramMB, cardVRAMMB, vramPct = eff, int(g.GetVramMb()), int(g.GetMaxVramPct())
 		}
@@ -2241,23 +2803,11 @@ func (d *Daemon) checkPauseSignals(pauseCh chan bool) {
 	for {
 		select {
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-				d.logger.Info("daemon paused by resource monitor")
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-				d.logger.Info("daemon paused due to thermal throttle")
-			} else {
-				d.logger.Info("daemon resumed from thermal throttle")
-			}
-			d.mu.Unlock()
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -2288,25 +2838,11 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 		case <-ctx.Done():
 			return false
 		case shouldPause := <-pauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "scheduled"
-			}
-			d.mu.Unlock()
-			if !shouldPause {
-				d.logger.Info("daemon resumed by resource monitor")
-			}
+			d.setAutoPause(pauseSourceResource, shouldPause)
 		case shouldPause := <-d.thermalPauseCh:
-			d.mu.Lock()
-			d.paused = shouldPause
-			if shouldPause {
-				d.pauseReason = "thermal"
-			}
-			d.mu.Unlock()
-			if !shouldPause {
-				d.logger.Info("daemon resumed from thermal throttle")
-			}
+			d.setAutoPause(pauseSourceThermal, shouldPause)
+		case shouldPause := <-d.yieldPauseCh:
+			d.setAutoPause(pauseSourceBusy, shouldPause)
 		case shouldPause := <-d.userPauseCh:
 			d.mu.Lock()
 			d.userPaused = shouldPause
@@ -2316,6 +2852,73 @@ func (d *Daemon) waitForResume(ctx context.Context, pauseCh chan bool) bool {
 			}
 		}
 	}
+}
+
+// Automatic pause sources. A user pause is separate (userPaused): it is the
+// one `resume` undoes.
+const (
+	pauseSourceResource = "scheduled" // the resource monitor: schedule window, low disk
+	pauseSourceThermal  = "thermal"   // the thermal monitor
+	pauseSourceBusy     = "busy"      // the yield monitor: other programs need the CPU (TB-83)
+)
+
+// setAutoPause records one automatic source's pause (on) or resume (off)
+// and re-derives the daemon's paused state and reported reason from ALL the
+// sources. Before the yield monitor joined, one flag was overwritten by
+// whichever monitor signalled last, so a source resuming could unfreeze work
+// another still held paused; each source now keeps its own flag. The reason
+// ranks the sources — thermal over busy over the schedule — so the most
+// serious explanation is the one shown when several hold at once.
+func (d *Daemon) setAutoPause(source string, on bool) {
+	d.mu.Lock()
+	switch source {
+	case pauseSourceResource:
+		d.resourcePaused = on
+	case pauseSourceThermal:
+		d.thermalPaused = on
+	case pauseSourceBusy:
+		d.busyPaused = on
+	}
+	d.paused = d.resourcePaused || d.thermalPaused || d.busyPaused
+	d.pauseReason = d.autoPauseReasonLocked()
+	stillPaused := d.paused
+	stillBy := d.pauseReason
+	d.mu.Unlock()
+
+	var msg string
+	switch {
+	case source == pauseSourceResource && on:
+		msg = "daemon paused by resource monitor"
+	case source == pauseSourceResource:
+		msg = "daemon resumed by resource monitor"
+	case source == pauseSourceThermal && on:
+		msg = "daemon paused due to thermal throttle"
+	case source == pauseSourceThermal:
+		msg = "daemon resumed from thermal throttle"
+	case on:
+		msg = "daemon paused: other programs need the CPU (yield)"
+	default:
+		msg = "daemon resumed: other programs' CPU use fell (yield)"
+	}
+	if !on && stillPaused {
+		d.logger.Info(msg, "still_paused_by", stillBy)
+		return
+	}
+	d.logger.Info(msg)
+}
+
+// autoPauseReasonLocked ranks the automatic sources currently holding a
+// pause. Caller holds d.mu.
+func (d *Daemon) autoPauseReasonLocked() string {
+	switch {
+	case d.thermalPaused:
+		return pauseSourceThermal
+	case d.busyPaused:
+		return pauseSourceBusy
+	case d.resourcePaused:
+		return pauseSourceResource
+	}
+	return ""
 }
 
 // waitForScheduleActive blocks until the scheduler says the daemon may run, and
@@ -2449,7 +3052,6 @@ func (d *Daemon) Pause() error {
 		return fmt.Errorf("already paused")
 	}
 	d.userPaused = true
-	d.pauseReason = "user"
 	d.mu.Unlock()
 	// Signal the daemon loop (non-blocking).
 	select {
@@ -2491,7 +3093,9 @@ func (d *Daemon) IsPaused() bool {
 
 // PauseReason returns the reason the daemon is paused, or empty string if not
 // paused. A user pause outranks everything (it is the state `resume` undoes);
-// then the signal-driven reason; then the live schedule verdict (TB-44).
+// then the signal-driven reason — "thermal" over "busy" over "scheduled" when
+// several sources hold at once (setAutoPause); then the live schedule verdict
+// (TB-44).
 func (d *Daemon) PauseReason() string {
 	d.mu.Lock()
 	if d.userPaused {
@@ -2508,6 +3112,38 @@ func (d *Daemon) PauseReason() string {
 		return "scheduled"
 	}
 	return ""
+}
+
+// PauseDetail is one sentence of detail behind PauseReason, or "" when the
+// reason needs none. For "busy" it is the measured share of the CPU other
+// programs are using and both thresholds, so `status` and the app can say
+// what the volunteer's setting saw (TB-83).
+func (d *Daemon) PauseDetail() string {
+	if d.PauseReason() != pauseSourceBusy || d.yieldMonitor == nil {
+		return ""
+	}
+	return runtime.DescribeYieldPause(d.yieldMonitor.Snapshot())
+}
+
+// YieldSnapshot reports the yield monitor's state (TB-83); the zero value
+// when the daemon has none.
+func (d *Daemon) YieldSnapshot() runtime.YieldSnapshot {
+	if d.yieldMonitor == nil {
+		return runtime.YieldSnapshot{}
+	}
+	return d.yieldMonitor.Snapshot()
+}
+
+// ThermalCapability reports where this machine's CPU temperature comes from
+// (TB-77): as the thermal monitor detected when it started, or detected now
+// if the monitors have not started yet.
+func (d *Daemon) ThermalCapability() runtime.ThermalCapability {
+	if d.thermalMonitor != nil {
+		if cap := d.thermalMonitor.Capability(); cap.CPUSource != "" {
+			return cap
+		}
+	}
+	return runtime.ThermalCapabilityReader()
 }
 
 // scheduleClosed reports whether the scheduler currently forbids running —
@@ -2528,7 +3164,7 @@ type CurrentTask struct {
 	CheckpointSequence    int32
 	LastCheckpointAt      time.Time
 	ResumedFromCheckpoint bool
-	EstimatedSeconds      float64 // benchmark-based estimate (0 = unknown)
+	EstimatedSeconds      float64 // expected total seconds (estSecondsForUnit; 0 = unknown)
 	Suspended             bool
 	TotalPausedSeconds    int
 	DeadlineSeconds       int32
@@ -2544,11 +3180,7 @@ func (d *Daemon) GetCurrentTasks() []CurrentTask {
 	if d.slotManager == nil {
 		return nil
 	}
-	var dcfFunc func(string) float64
-	if d.dcfTracker != nil {
-		dcfFunc = d.dcfTracker.Get
-	}
-	return d.slotManager.GetCurrentTasks(d.benchmarkFPOPS, dcfFunc)
+	return d.slotManager.GetCurrentTasks(d.estSecondsForUnit)
 }
 
 // SuspendTask suspends a single task by work unit ID.
@@ -2640,21 +3272,49 @@ func (d *Daemon) GetMultiClient() *MultiServerClient {
 
 // ApplyConfig applies new configuration to the running daemon without restart.
 // Changing max_concurrent_tasks requires a restart — slot count is fixed at init.
+//
+// The resource_limits block is live (TB-79): a change reaches, in this one
+// call, the budgets admission books against (they read the configuration),
+// the advertisement every poll carries as CurrentAvailable — the figure a
+// head's dispatch gate compares a leaf's requirements against, so the head
+// agrees with admission from the next poll — and the memory ceilings the
+// runtimes enforce (they read the live budget). Before this the advertisement
+// and the ceilings were the start-up figures until a restart, so a lowered
+// memory limit left the head sending leafs the budget could not hold and
+// the client running them above what admission had booked.
 func (d *Daemon) ApplyConfig(newCfg *config.Config) {
 	d.mu.Lock()
-	oldMax := d.cfg.MaxConcurrentTasks
+	oldCfg := d.cfg
 	d.cfg = newCfg
 	d.mu.Unlock()
 
-	if newCfg.MaxConcurrentTasks != oldMax && oldMax > 0 {
+	if oldCfg != nil && newCfg.MaxConcurrentTasks != oldCfg.MaxConcurrentTasks && oldCfg.MaxConcurrentTasks > 0 {
 		d.logger.Warn("max_concurrent_tasks changed — restart daemon to apply",
-			"old", oldMax,
+			"old", oldCfg.MaxConcurrentTasks,
 			"new", newCfg.MaxConcurrentTasks,
 		)
 	}
 
 	// Reinitialize weights from new config.
 	d.initializeWeights()
+
+	if oldCfg == nil || oldCfg.ResourceLimits != newCfg.ResourceLimits || !reflect.DeepEqual(oldCfg.GPUOverrides, newCfg.GPUOverrides) {
+		d.setAdvertisedResourceLimits()
+		hw := d.advertisedHardware()
+		d.logger.Info("resource limits changed: heads are told the new figures from the next poll, admission books against them now, and running tasks keep the ceilings they started with",
+			"max_memory_mb", newCfg.ResourceLimits.MaxMemoryMB, "advertised_max_memory_mb", hw.GetMaxMemoryMb(),
+			"max_cpu_cores", newCfg.ResourceLimits.MaxCPUCores, "advertised_max_cpu_cores", hw.GetMaxCpuCores(),
+			"max_disk_gb", newCfg.ResourceLimits.MaxDiskGB, "max_gpu_vram_pct", newCfg.ResourceLimits.MaxGPUVRAMPct,
+			"advertised_gpus", len(hw.GetGpus()))
+	}
+
+	// A raised memory limit does not raise what the container engine's VM can
+	// hold (TB-63): say so again against the new figure, or clear the notice
+	// when the limit now fits. The CPU limit likewise (TB-75) — and a changed
+	// CPU budget is re-split among the tasks already running at once.
+	d.refreshContainerMemoryNotice()
+	d.refreshContainerCPUNotice()
+	d.rebalanceCPUShares()
 }
 
 // SetBackoff overrides backoff durations (for testing).
@@ -2684,9 +3344,198 @@ func (d *Daemon) GetWeightedSelector() *WeightedSelector {
 	return d.weightedSelector
 }
 
-// GetMachineManager returns the Podman machine manager, or nil if not configured.
+// GetMachineManager returns the Podman machine manager, or nil if no Podman
+// binary has been found. Since TB-59 the manager can appear after start (the
+// detector creates it the first time a probe finds the binary), so the
+// detector's is preferred over the one handed in at construction.
 func (d *Daemon) GetMachineManager() *runtime.PodmanMachineManager {
+	if mm := d.containerFactory.MachineManager(); mm != nil {
+		return mm
+	}
 	return d.machineManager
+}
+
+// advertisedHardware returns the hardware capabilities this machine currently
+// advertises to heads — what registration sends and what every poll carries
+// as CurrentAvailable. May be nil in tests that never advertise.
+func (d *Daemon) advertisedHardware() *lettucev1.HardwareCapabilities {
+	d.hwMu.RLock()
+	defer d.hwMu.RUnlock()
+	return d.cachedHW
+}
+
+// AdvertisedHardware is advertisedHardware for the management package's tests.
+func (d *Daemon) AdvertisedHardware() *lettucev1.HardwareCapabilities {
+	return d.advertisedHardware()
+}
+
+// updateAdvertisedHardware replaces the advertised hardware with a copy that
+// mutate has changed. A copy, not an in-place write: the fetcher hands the
+// current advertisement to gRPC on its own goroutine, and a field write under
+// it would be a race. mutate runs under hwMu and must not read the
+// advertisement back through advertisedHardware.
+func (d *Daemon) updateAdvertisedHardware(mutate func(hw *lettucev1.HardwareCapabilities)) {
+	d.hwMu.Lock()
+	defer d.hwMu.Unlock()
+	if d.cachedHW == nil {
+		return
+	}
+	hw := proto.Clone(d.cachedHW).(*lettucev1.HardwareCapabilities)
+	mutate(hw)
+	d.cachedHW = hw
+}
+
+// setAdvertisedMemoryMB replaces the advertised hardware with a copy whose
+// memory budget is mb (the TB-63 late-detection clip).
+func (d *Daemon) setAdvertisedMemoryMB(mb int) {
+	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) { hw.MaxMemoryMb = int32(mb) })
+}
+
+// setAdvertisedResourceLimits rebuilds the resource_limits half of the
+// advertisement from the live configuration (TB-79): the memory and CPU
+// budgets (the configuration clipped to the container engine's VM where
+// there is one — MemoryBudgetMB, CPUBudgetCores), the disk allowance, the
+// bandwidth cap, and the GPU list with the configured share and the per-GPU
+// overrides applied to the detection the start-up advertisement was built
+// from — the same rules registration used (client.ApplyGPUConfig), so a
+// changed share advertises exactly what a restart would. The detected
+// figures (total memory, core count, free disk, the GPU models) are kept.
+// Without a retained detection the GPU list is left as it is.
+func (d *Daemon) setAdvertisedResourceLimits() {
+	memMB, cores := d.MemoryBudgetMB(), d.CPUBudgetCores()
+	d.hwMu.RLock()
+	detected := d.detectedGPUs
+	d.hwMu.RUnlock()
+	d.updateAdvertisedHardware(func(hw *lettucev1.HardwareCapabilities) {
+		hw.MaxMemoryMb = int32(memMB)
+		hw.MaxCpuCores = int32(cores)
+		hw.MaxDiskMb = int64(d.cfg.ResourceLimits.MaxDiskGB) * 1024
+		hw.MaxBandwidthMbps = int32(d.cfg.ResourceLimits.MaxBandwidthMbps)
+		if detected != nil {
+			hw.Gpus = client.ApplyGPUConfig(d.cfg, detected)
+		}
+	})
+}
+
+// ContainerVMMemoryMB reports the memory of the VM the registered container
+// engine runs inside (0 when there is no container runtime, the engine shares
+// the host's RAM, or its VM size is unknown) — the fact behind a memory budget
+// below the configuration (TB-63).
+func (d *Daemon) ContainerVMMemoryMB() int {
+	if d.runtimeRegistry == nil || d.runtimeRegistry.GetRuntime("container") == nil {
+		return 0
+	}
+	_, engineMB := d.containerFactory.ContainerMemory()
+	return engineMB
+}
+
+// MemoryBudgetMB is the whole-machine memory budget this daemon works to: the
+// configured max_memory_mb, clipped to what the container engine's VM can hold
+// less headroom where the engine runs inside one (runtime.ContainerMemoryBudgetMB,
+// TB-63). It is the figure advertised to heads, booked at admission and given
+// to the container runtime as its ceiling, so all three agree. With no
+// container engine, or one that shares the host's RAM, it is the configuration.
+func (d *Daemon) MemoryBudgetMB() int {
+	cfgMB := 0
+	if d.cfg != nil {
+		cfgMB = d.cfg.ResourceLimits.MaxMemoryMB
+	}
+	return runtime.ContainerMemoryBudgetMB(cfgMB, d.ContainerVMMemoryMB())
+}
+
+// MemoryLimitedByVM reports whether the container engine's VM, not the
+// configuration, is what bounds this machine's memory budget (TB-63).
+func (d *Daemon) MemoryLimitedByVM() bool {
+	if d.cfg == nil {
+		return false
+	}
+	return d.ContainerVMMemoryMB() > 0 && d.MemoryBudgetMB() < d.cfg.ResourceLimits.MaxMemoryMB
+}
+
+// applyContainerMemoryBudget lowers the advertised memory budget to what the
+// container engine's VM can hold, when that is below the configuration, and
+// raises the volunteer-facing notice. Called once a container runtime is
+// registered — at start (start-up clamps the advertisement it registers with
+// before the daemon exists, and Run raises the notice) and on a late detection
+// (registerContainerRuntime, before the heads are re-told).
+func (d *Daemon) applyContainerMemoryBudget() {
+	if d.MemoryLimitedByVM() {
+		d.setAdvertisedMemoryMB(d.MemoryBudgetMB())
+	}
+	d.refreshContainerMemoryNotice()
+}
+
+// refreshContainerMemoryNotice keeps the "container_memory_clipped" notice in
+// step with the facts: raised with one WARN whenever the configured memory
+// limit exceeds what the container engine's VM can hold, naming both figures
+// and the remedy; resolved when the limit fits (the VM was enlarged and the
+// engine re-detected, or the limit was lowered).
+func (d *Daemon) refreshContainerMemoryNotice() {
+	if !d.MemoryLimitedByVM() {
+		d.notices.Resolve("container_memory_clipped", "", "")
+		return
+	}
+	cfgMB := d.cfg.ResourceLimits.MaxMemoryMB
+	budget := d.MemoryBudgetMB()
+	engineMB := d.ContainerVMMemoryMB()
+	d.logger.Warn("container engine's VM is smaller than the memory limit; container work is limited to the VM — heads are told the smaller figure and only send leafs that fit it",
+		"engine_vm_memory_mb", engineMB, "headroom_mb", runtime.ContainerVMHeadroomMB,
+		"container_memory_budget_mb", budget, "max_memory_mb", cfgMB,
+		"remedy", "enlarge the VM's memory (Podman: `podman machine stop`, `podman machine set --memory <MB>`, `podman machine start`; Podman Desktop or Docker Desktop: Settings → Resources) — or lower the memory limit to the budget so the two agree")
+	d.notices.Notify(NoticeWarn, "container_memory_clipped",
+		fmt.Sprintf("Container work on this machine is limited to %d MB: the container engine runs inside a virtual machine with %d MB, and %d MB is kept back for the machine itself. Your memory limit of %d MB is not what heads are told — they see %d MB and only send leafs that fit. To run bigger leafs, enlarge the machine's memory (Podman: `podman machine set --memory`; Podman Desktop or Docker Desktop: Settings → Resources) and restart Lettuce.",
+			budget, engineMB, runtime.ContainerVMHeadroomMB, cfgMB, budget),
+		"", "")
+}
+
+// containerKillNote explains an exit code 137 on a container unit: 137 is a
+// kill, and for a container almost always the out-of-memory kill. When the unit
+// declares more than container work on this machine can be given — the engine's
+// VM is smaller than the declaration — the note says so with both figures, so
+// the abandon reason the head logs and the leaf-failing notice the volunteer
+// sees read "killed for memory: … VM …" instead of a bare exit code (TB-63).
+// Empty for any other exit code or a non-container unit.
+func (d *Daemon) containerKillNote(wu *runtime.WorkUnit, exitCode int) string {
+	if wu == nil || exitCode != 137 || wu.Runtime != runtime.RuntimeContainer {
+		return ""
+	}
+	budget := d.MemoryBudgetMB()
+	declared := int(wu.ExecutionSpec.MaxMemoryMB)
+	booked := runtime.BookedMemMB(declared, budget)
+	if engineMB := d.ContainerVMMemoryMB(); engineMB > 0 && declared > budget {
+		return fmt.Sprintf("killed for memory: the unit declares %d MB but container work on this machine is limited to %d MB by the container engine's VM of %d MB", declared, budget, engineMB)
+	}
+	return fmt.Sprintf("killed, usually out of memory at its %d MB limit", booked)
+}
+
+// ContainerBackend reports the engine the registered container runtime is
+// connected to, and whether a container runtime is registered at all. The
+// management API reports THIS — what the daemon actually runs on — rather
+// than the config's backend preference, which is empty on an auto-configured
+// host and said "not installed" beside running containers (TB-59).
+func (d *Daemon) ContainerBackend() (runtime.BackendInfo, bool) {
+	if d.runtimeRegistry == nil {
+		return runtime.BackendInfo{}, false
+	}
+	rt := d.runtimeRegistry.GetRuntime("container")
+	if rt == nil {
+		return runtime.BackendInfo{}, false
+	}
+	if b, ok := d.containerFactory.Backend(); ok {
+		return b, true
+	}
+	// A runtime registered without the detector (tests, a hand-built
+	// registry): the runtime itself knows its backend kind at least.
+	if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil {
+		return runtime.BackendInfo{Backend: cr.Backend()}, true
+	}
+	return runtime.BackendInfo{}, true
+}
+
+// ContainerDetectError is why the most recent engine probe found an engine but
+// could not build its runtime; empty when it could, or found nothing.
+func (d *Daemon) ContainerDetectError() string {
+	return d.containerFactory.LastError()
 }
 
 // SetSlotManagerForTest injects a SlotManager into the daemon for testing.
@@ -3125,10 +3974,20 @@ func (d *Daemon) serverByName(name string) *ServerConnection {
 }
 
 // recordHistory appends a history entry and logs a warning on failure.
+//
+// The entry carries the leaf's display name alongside its id when the head cache
+// knows it, so `history` can show "extract2-student-crowd" rather than a UUID
+// prefix even with the daemon stopped (TB-46). resolveLeafInfo answers with the
+// id itself when the leaf is unknown; that is not a name and is not recorded.
 func (d *Daemon) recordHistory(wu *runtime.WorkUnit, wallClockSeconds int64, cpuSeconds int64, accepted bool, serverName string) {
+	leafName, _ := d.resolveLeafInfo(wu.LeafID)
+	if leafName == wu.LeafID {
+		leafName = ""
+	}
 	if histErr := AppendHistory(d.cfg.DataDir, HistoryEntry{
 		WorkUnitID:       wu.ID,
 		LeafID:           wu.LeafID,
+		LeafName:         leafName,
 		ServerName:       serverName,
 		CompletedAt:      time.Now().UTC(),
 		WallClockSeconds: wallClockSeconds,
@@ -3221,8 +4080,11 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 				break
 			}
 
-			// Resume the frozen process.
-			handle := NewNativeProcessHandle(pt.PID)
+			// Resume the frozen process. Its CPU cap was set by the previous
+			// session's limiter and cannot be rewritten by this one (the cgroup
+			// or Job Object bookkeeping died with that process), so the handle
+			// carries no CPU adjuster: it keeps the share it was given.
+			handle := NewNativeProcessHandle(pt.PID, nil)
 			if err := handle.Resume(); err != nil {
 				d.logger.Warn("failed to resume orphan process, will re-execute",
 					"pid", pt.PID, "error", err)
@@ -3375,6 +4237,20 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			break
 		}
 
+		// A container unit whose previous session recorded its container —
+		// paused at quit, or left running by a crash: unpause and adopt it
+		// instead of running the unit again beside its frozen twin, the
+		// container analogue of the PID resume above (TB-74). A container that
+		// is gone or not resumable falls through to re-execution, whose Execute
+		// removes the leftover before creating a new one.
+		var adoptedBy *runtime.ContainerRuntime
+		if pt.ContainerID != "" {
+			if cr, ok := rt.(*runtime.ContainerRuntime); ok && cr != nil && cr.ResumeWorkUnitContainer(ctx, pt.WorkUnitID, pt.ContainerID) {
+				prep.OrphanContainerID = pt.ContainerID
+				adoptedBy = cr
+			}
+		}
+
 		// Build a synthetic PreFetchItem for StartSlot.
 		item := &PreFetchItem{
 			WU:        wu,
@@ -3389,7 +4265,16 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			d.logger.Warn("failed to resume persisted task",
 				"work_unit_id", pt.WorkUnitID, "error", startErr)
 			d.slotManager.ReturnSlotID(slotID)
+			if adoptedBy != nil {
+				// Unpaused above and now supervised by nothing.
+				adoptedBy.RemoveWorkUnitContainers(ctx, pt.WorkUnitID, "")
+			}
 			continue
+		}
+		if adoptedBy != nil {
+			// The slot pauses and unpauses the adopted container through this
+			// handle from now on, and persists its id again at the next quit.
+			d.slotManager.SetProcessHandle(slotID, NewContainerProcessHandle(adoptedBy.Client(), pt.ContainerID))
 		}
 
 		resumed++
@@ -3398,6 +4283,7 @@ func (d *Daemon) resumePersistedTasks(ctx context.Context) {
 			"leaf_id", pt.LeafID,
 			"work_dir", pt.WorkDir,
 			"checkpoint_seq", pt.CheckpointSequence,
+			"adopted_container", prep.OrphanContainerID,
 		)
 	}
 

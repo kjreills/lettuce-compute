@@ -43,6 +43,42 @@ The flow you'll follow:
 
 ---
 
+## Sizing your worker pool (recommended)
+
+A volunteer's CPU allowance is a budget for the whole machine that every running
+task shares equally, and the volunteer client caps each task at its share (a
+container CPU quota, a cgroup or Job Object cap for native work). Inside a
+container `os.cpu_count()` / `runtime.NumCPU()` / `nproc` still report every CPU
+of the machine, so a program that sizes its thread pool from them oversubscribes
+its cap and stalls on throttling instead of computing.
+
+Size the pool from what the task was actually given instead. The client sets, for
+every runtime:
+
+- **`LETTUCE_CPU_LIMIT`** — the task's share in cores, possibly fractional (`2`,
+  `1.5`, `0.5`). Round it to whole threads, never below one.
+- **`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `NUMEXPR_MAX_THREADS`** — the same figure as a whole thread count, which
+  OpenMP, NumPy/SciPy (OpenBLAS/MKL) and numexpr read on their own; a library
+  that honours them needs no code change.
+
+```python
+import math, os
+workers = max(1, round(float(os.environ.get("LETTUCE_CPU_LIMIT", "1"))))
+```
+
+```go
+limit, _ := strconv.ParseFloat(os.Getenv("LETTUCE_CPU_LIMIT"), 64)
+workers := max(1, int(math.Round(limit)))
+```
+
+On Linux the same figure can be read from the cgroup (`/sys/fs/cgroup/cpu.max`:
+quota ÷ period). The share is fixed for the life of the process — the cap moves
+when other tasks on the machine start or finish, but a running process is not
+told — so read it once at start-up and do not re-derive it from the CPU count.
+
+---
+
 ## Reporting progress (recommended)
 
 Have your entrypoint report progress so contributors can see how far along a work
@@ -361,7 +397,7 @@ What the key settings mean:
 | `comparison_mode: NUMERIC_TOLERANCE` | Results agree if within `numeric_tolerance`. Monte Carlo is stochastic, so exact match won't do. |
 | `compare_fields` / `ignore_fields` (important with redundancy ≥ 2) | Which output fields the comparison covers. **Without them, every field of the output JSON is compared** — including non-semantic fields like `compute_time_ms`, which differ between two honest volunteers and would make their otherwise-matching results DISAGREE. Set `compare_fields` to the science that must match (here the `result` field), or `ignore_fields` to drop known-noisy fields. With `redundancy_factor: 1` nothing is ever compared, but set it anyway so raising redundancy later doesn't silently start rejecting honest results. |
 | `agreement_threshold: 1.0` | Fraction of the redundant copies that must agree to validate (the quorum). `1.0` = unanimous. |
-| `max_total_copies` / `max_error_copies` (optional) | Hard caps that bound a non-converging unit. `max_total_copies` is the dead-letter ceiling (default `target_copies + 6`): once this many copies have been created with the quorum still unmet, the unit is parked `FAILED` (recoverable by the operator via the work-unit `revive` endpoint — see the head-setup guide). `max_error_copies` bounds timed-out/abandoned/disagreeing copies (default unlimited); when set it must be at least `target_copies`, so an honest run of expiries alone cannot trip it. Copies a volunteer returns **unused** because its work buffer could not hold them count toward neither cap — only real attempts and failures spend a unit's budget. Both operator-tunable per leaf; omit for the defaults. |
+| `max_total_copies` / `max_error_copies` (optional) | Hard caps that bound a non-converging unit. `max_total_copies` is the dead-letter ceiling (default `target_copies + 6`): once this many copies have been created with the quorum still unmet, the unit is parked `FAILED` (recoverable by the operator via the work-unit `revive` endpoint — see the head-setup guide). `max_error_copies` bounds timed-out/abandoned/disagreeing copies (default unlimited); when set it must be at least `target_copies`, so an honest run of expiries alone cannot trip it. Copies a volunteer returns **unused** because its work buffer could not hold them count toward neither cap, and a volunteer that abandons a unit **without ever starting it** (an unreachable container engine, no runtime, a prepare failure) counts **once** toward both caps however often it repeats — only real attempts, and distinct volunteers' failures, spend a unit's budget. Both operator-tunable per leaf; omit for the defaults. |
 | `deadline_multiplier: 3.0` | Sets each work unit's timeout. By default `deadline_seconds = 3600 × multiplier` (so `3.0` = 3h, `0.5` = 30min); set an explicit `deadline_seconds` (next row) to give an absolute deadline instead. Any value, no cap. **Stamped at generation** — changing it only affects newly generated units. A copy not returned by its deadline is redispatched to another volunteer (no per-attempt cap; a hopeless unit eventually dead-letters after `redundancy_factor + 6` total copies). `max_reassignments` is a deprecated no-op, kept only so older configs still validate. |
 | `deadline_seconds` (optional) | An absolute per-work-unit deadline in seconds that **overrides** `deadline_multiplier` when set — use it to match the deadline to how long a unit really takes (and to how long your volunteers tend to pause), instead of the fixed 3600s baseline. Must be > 0; for no hard deadline use `no_deadline: true` instead. At activation the head logs the resolved deadline and **warns when it is shorter than `max_cpu_seconds`** — the case where a unit that uses its full CPU budget could never be returned in time. |
 | `aggregation_config.output_field: "result"` | The JSON field the aggregator reads from each result (the π estimate). |

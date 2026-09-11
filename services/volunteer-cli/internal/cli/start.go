@@ -126,6 +126,15 @@ func runStart(cmd *cobra.Command, args []string) error {
 		"data_dir", cfg.DataDir,
 	)
 
+	// A head entry an older build stored as a URL (desktop-v2.0.0, `init
+	// --server https://…` before v0.12.0) was rewritten to a dialable target
+	// when the config loaded (TB-62). Say so once per start, so the log
+	// explains why the address dialled differs from the file's until the
+	// next config write persists the repair.
+	for _, repair := range cfg.ServerAddressRepairs() {
+		logger.Info("repaired stored head address", "repair", repair)
+	}
+
 	// Artifact netguard opt-in (loud, off by default): if the operator listed heads
 	// in LETTUCE_VOLUNTEER_ALLOW_PRIVATE_ARTIFACTS, say so at startup — once per
 	// head, plus a loud flag for entries that match no configured head (a typo
@@ -153,7 +162,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// never gets container work it can only abandon (which would churn units to
 	// FAILED on the head). native/wasm are always registered; container only when
 	// a backend is detected and initializes.
-	registry, machineManager := buildRuntimeRegistry(cfg, logger)
+	registry, containerFactory := buildRuntimeRegistry(cfg, logger)
 	machineRuntimes := advertisedRuntimes(registry)
 	logger.Info("runtimes available on this machine", "runtimes", machineRuntimes)
 
@@ -163,10 +172,11 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// the VM it started. The ownership check lives inside the helper and is
 	// evaluated AT SHUTDOWN, so a machine that was already running when the
 	// daemon came up — a host-wide singleton every other container on the box
-	// depends on — is left exactly as it was found (PB-27).
-	if machineManager != nil {
-		defer stopMachineIfDaemonStarted(machineManager, logger)
-	}
+	// depends on — is left exactly as it was found (PB-27). The manager is read
+	// at shutdown too, not captured now: the daemon keeps probing for an engine
+	// while it has none (TB-59), and a later probe may be the one that finds
+	// Podman and starts its machine.
+	defer func() { stopMachineIfDaemonStarted(containerFactory.MachineManager(), logger) }()
 
 	// Connect to all configured servers — one gRPC connection per head address.
 	// One entry per head is guaranteed by config.Load's entry migration (PB-16):
@@ -176,6 +186,39 @@ func runStart(cmd *cobra.Command, args []string) error {
 	// gone.
 	var connections []*daemon.ServerConnection
 	var stateServers []daemon.ServerState
+
+	// Detect hardware exactly once per start. Detection launches vendor tools
+	// and reads platform registries; registration used to run it again for
+	// every head and the daemon a further time, so a single start probed the
+	// machine at least twice — and on Windows each probe could raise its own
+	// UAC prompt. The one result is advertised to every head and handed to the
+	// daemon.
+	hardware, detectedGPUs := client.DetectHardwareWithGPUs(cfg)
+
+	// On macOS/Windows the container engine runs inside a VM whose memory is
+	// the real ceiling for container work; when it is smaller than the memory
+	// limit, heads are told the smaller figure so they only send leafs the VM
+	// can hold (TB-63). The daemon logs the WARN and raises the notice once it
+	// runs; this is the one place the advertisement registration sends is built.
+	if containerFactory.ClampAdvertisedMemory(hardware) {
+		budget, engineMB := containerFactory.ContainerMemory()
+		logger.Info("advertising the container memory budget instead of the memory limit: the container engine's VM is smaller",
+			"advertised_max_memory_mb", budget, "engine_vm_memory_mb", engineMB, "max_memory_mb", cfg.ResourceLimits.MaxMemoryMB)
+	}
+	// The VM's vCPU count bounds the CPU budget the same way (TB-75).
+	if containerFactory.ClampAdvertisedCPU(hardware) {
+		budget, engineCPUs := containerFactory.ContainerCPUs()
+		logger.Info("advertising the VM's CPU count instead of the CPU limit: the container engine's VM has fewer CPUs",
+			"advertised_max_cpu_cores", budget, "engine_vm_cpus", engineCPUs, "max_cpu_cores", cfg.ResourceLimits.MaxCPUCores)
+	}
+
+	// Volunteer-facing notices and per-head version/update state are created
+	// here, before the daemon exists, because registration below is one of the
+	// two places a head can reject this build as too old — and a head that does
+	// so never becomes a connection the daemon could report on. Both are handed
+	// to the daemon so the management API serves what start-up observed.
+	notices := daemon.NewNoticeLog()
+	headStatus := daemon.NewHeadStatusTracker()
 
 	for _, srv := range cfg.Servers {
 		name := srv.Name
@@ -218,16 +261,21 @@ func runStart(cmd *cobra.Command, args []string) error {
 		} else {
 			headVersion = statusResp.Version
 		}
+		headStatus.SetVersion(srv.GRPCAddress, headVersion)
 
 		// Advertise per-head: only the runtimes this machine can run AND this head is
 		// trusted to run (WASM always; CONTAINER/NATIVE per the attach-time trust choice).
 		advertised := advertisedForServer(registry, srv)
 		logger.Info("advertising runtimes to head", "server", name, "advertised", advertised)
-		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, advertised...)
+		volID, isNew, issuedHostID, err := client.Register(cmd.Context(), grpcClient, pub, hostIDStore, srv.GRPCAddress, cfg, cfgPath, hardware, advertised...)
 		if err != nil {
 			if client.IsVolunteerTooOldError(err) {
 				logger.Warn("this volunteer build is too old for the head; run 'lettuce-volunteer update'",
 					"server", name, "error", err)
+				headStatus.MarkUpdateRequired(srv.GRPCAddress)
+				notices.Notify(daemon.NoticeWarn, "update_required",
+					fmt.Sprintf("Head %q rejected this volunteer build as too old at registration; it will not serve work until the volunteer is updated. Run 'lettuce-volunteer update'. (%v)", name, err),
+					name, "")
 			}
 			logger.Warn("failed to register with server, skipping",
 				"server", name, "error", err)
@@ -308,14 +356,19 @@ func runStart(cmd *cobra.Command, args []string) error {
 
 	// Create daemon with runtime registry.
 	d := daemon.NewDaemon(daemon.DaemonConfig{
-		Config:          cfg,
-		PubKey:          pub,
-		PrivKey:         priv,
-		HostIDStore:     hostIDStore,
-		Servers:         connections,
-		RuntimeRegistry: registry,
-		MachineManager:  machineManager,
-		Logger:          logger,
+		Config:           cfg,
+		PubKey:           pub,
+		PrivKey:          priv,
+		HostIDStore:      hostIDStore,
+		Servers:          connections,
+		RuntimeRegistry:  registry,
+		ContainerFactory: containerFactory,
+		Logger:           logger,
+		Hardware:         hardware,
+		DetectedGPUs:     detectedGPUs,
+		ClientVersion:    version,
+		Notices:          notices,
+		HeadStatus:       headStatus,
 	})
 
 	// Start management API server.
@@ -388,10 +441,12 @@ func stopMachineIfDaemonStarted(mm *runtime.PodmanMachineManager, logger *slog.L
 // buildRuntimeRegistry constructs the runtime registry. native and wasm are
 // always registered; the container runtime is added only when CONTAINER is
 // configured AND a working backend (Docker/Podman, setting up a Podman machine
-// if needed) is detected and initializes. The machine manager is returned so
-// the caller can undo a daemon-started Podman machine on shutdown (the manager
-// itself tracks whether this process started it — see StartedByThisProcess).
-func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *runtime.PodmanMachineManager) {
+// if needed) is detected and initializes. The detector that did (or failed to
+// do) that is returned: the daemon keeps probing with it while no container
+// runtime is registered (TB-59), and it owns the Podman machine manager so the
+// caller can undo a daemon-started machine on shutdown (the manager itself
+// tracks whether this process started it — see StartedByThisProcess).
+func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.RuntimeRegistry, *daemon.ContainerRuntimeFactory) {
 	registry := daemon.NewRuntimeRegistry()
 
 	// SECURITY (BG-12, per-head trust): build native ONLY when at least one attached head
@@ -414,65 +469,24 @@ func buildRuntimeRegistry(cfg *config.Config, logger *slog.Logger) (*daemon.Runt
 	wasmRuntime.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB) // BG-16 booked-memory clamp
 	registry.Register(wasmRuntime)
 
-	// Register container runtime if configured.
-	var machineManager *runtime.PodmanMachineManager
+	// Register container runtime if configured. The detector builds it exactly
+	// as the daemon's later re-detection does (backend preference, Podman
+	// machine bring-up, BG-16 clamps, BG-13 hardening, GPUs); the two log
+	// lines below are the start-up tells the operator guides quote.
+	containerFactory := daemon.NewContainerRuntimeFactory(cfg, logger)
 	if anyServerTrusts(cfg.Servers, "CONTAINER") {
-		// Honor the operator's configured backend preference (container_backend).
-		// When set to "docker", Docker is chosen if present so large images use
-		// host storage instead of a Podman-machine VM. Empty = auto (Podman first).
-		preferred := runtime.ContainerBackend(cfg.ContainerBackend)
-		backend := runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), preferred)
-		if backend.Backend == runtime.BackendPodman {
-			machineManager = runtime.NewPodmanMachineManager(backend.BinaryPath, logger)
-			if machineManager.NeedsMachine() {
-				logger.Info("setting up Podman machine for container runtime")
-				cpus := cfg.ResourceLimits.MaxCPUCores
-				memMB := cfg.ResourceLimits.MaxMemoryMB
-				diskGB := cfg.ResourceLimits.MaxDiskGB
-				if cpus <= 0 {
-					cpus = 2
-				}
-				if memMB <= 0 {
-					memMB = 4096
-				}
-				if diskGB <= 0 {
-					diskGB = 20
-				}
-				if err := machineManager.Setup(cpus, memMB, diskGB); err != nil {
-					logger.Warn("podman machine setup failed, container runtime may be unavailable", "error", err)
-				} else if err := machineManager.WaitForReady(60 * time.Second); err != nil {
-					logger.Warn("podman machine not ready after setup", "error", err)
-				}
-				// Re-detect backend after machine setup to get updated socket path.
-				backend = runtime.DetectContainerBackendPreferred(runtime.BundledPodmanPath(), preferred)
-			}
-		}
-		if backend.Backend != runtime.BackendNone {
-			cr, err := runtime.NewContainerRuntimeForBackend(cfg.DataDir, logger, backend)
-			if err != nil {
-				logger.Warn("container runtime unavailable", "error", err)
-			} else {
-				cr.SetMaxCPUCores(cfg.ResourceLimits.MaxCPUCores)
-				cr.SetMaxGPUVRAMPct(cfg.ResourceLimits.MaxGPUVRAMPct)
-				// BG-16 booked memory/disk clamps + BG-13 hardening knobs from config.
-				cr.SetMemoryCeilingMB(cfg.ResourceLimits.MaxMemoryMB)
-				cr.SetDiskCeilingMB(cfg.ResourceLimits.MaxDiskGB * 1024)
-				cr.SetHardeningConfig(cfg.ResourceLimits.MaxPids, cfg.ContainerCapAdd, cfg.ContainerGPURelaxUser)
-				gpus := runtime.DetectGPUs()
-				if len(gpus) > 0 {
-					cr.SetGPUs(gpus)
-				}
-				if backend.Backend == runtime.BackendPodman {
-					runtime.EnsurePodmanGPUReady(logger)
-				}
-				registry.Register(cr)
-			}
-		} else {
+		cr, _, err := containerFactory.Build(true)
+		switch {
+		case cr != nil:
+			registry.Register(cr)
+		case err != nil:
+			logger.Warn("container runtime unavailable", "error", err)
+		default:
 			logger.Warn("container runtime configured but no backend available")
 		}
 	}
 
-	return registry, machineManager
+	return registry, containerFactory
 }
 
 // advertisedRuntimes returns the UPPERCASE runtime enum names the volunteer can

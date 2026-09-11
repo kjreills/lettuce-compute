@@ -377,6 +377,12 @@ func main() {
 	// exists, so the operator-requeue handler holds this ref; StartDispatchCache
 	// binds the live cache into it below.
 	dispatchCacheRef := server.NewDispatchCacheRef()
+	// TB-61: every state this transitioner writes (validate / reject / dead-letter /
+	// reopen) evicts the unit's staged dispatch candidate through the same handle. This
+	// instance serves the fault monitor, the recovery sweeper and content verification;
+	// the gRPC volunteer service's and the browser path's own instances are wired the
+	// same way where they are built (BindDispatchCacheRef, NewRouter).
+	transitioner.SetDispatchInvalidator(dispatchCacheRef)
 
 	deps := &server.Dependencies{
 		Pool:              pool,
@@ -552,7 +558,11 @@ func main() {
 	//     scans/logs AND keeps the hygiene sweep single-acting.
 	//   - racUpdater / staleVolunteerMonitor / challengeStore cleanup: idempotent
 	//     guarded UPDATE/DELETE sweeps; gated for tidiness now that the wrapper exists.
-	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger)
+	faultMonitor := server.NewFaultMonitor(wuRepo, assignRepo, checkpointRepo, leafRepo, reliabilityRepo, transitioner, logger).
+		// TB-82: every copy the timeout sweep closes is reported to the dispatch cache
+		// through the same late-bound handle the transitioner's eviction hook uses, so
+		// the closed copy's in-memory hold and its holder's bench are updated at once.
+		WithDispatchCache(dispatchCacheRef)
 	if anomalyChecker != nil {
 		// Operator visibility for the emission circuit breaker: a throttled WARN when
 		// the export has self-frozen. Wired only when the halt is armed, sharing the

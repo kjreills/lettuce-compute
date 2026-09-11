@@ -108,7 +108,7 @@ func daemonForOrphan(t *testing.T, pid int) (*Daemon, context.Context, context.C
 }
 
 func orphanTask(d *Daemon) (CurrentTask, bool) {
-	for _, task := range d.slotManager.GetCurrentTasks(0, func(string) float64 { return 0 }) {
+	for _, task := range d.slotManager.GetCurrentTasks(nil) {
 		if task.WorkUnitID == "wu-orphan" {
 			return task, true
 		}
@@ -131,7 +131,7 @@ func TestResumedOrphan_CoveredBySuspendAll(t *testing.T) {
 	child := startSpinChild(t)
 
 	// Freeze the child — stands in for the previous session's suspend-and-quit.
-	priorHandle := NewNativeProcessHandle(child.pid)
+	priorHandle := NewNativeProcessHandle(child.pid, nil)
 	if err := priorHandle.Suspend(); err != nil {
 		t.Skipf("cannot suspend a process on this platform/runner: %v", err)
 	}
@@ -177,7 +177,7 @@ func TestResumedOrphan_CoveredBySuspendAll(t *testing.T) {
 func TestResumedOrphan_SuspendedByScheduleGate(t *testing.T) {
 	child := startSpinChild(t)
 
-	priorHandle := NewNativeProcessHandle(child.pid)
+	priorHandle := NewNativeProcessHandle(child.pid, nil)
 	if err := priorHandle.Suspend(); err != nil {
 		t.Skipf("cannot suspend a process on this platform/runner: %v", err)
 	}
