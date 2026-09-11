@@ -14,7 +14,7 @@ set -euo pipefail
 
 : "${IMAGE_ID:?set IMAGE_ID to the container image reference, e.g. your-domain.com/gpu-leaf:1.0 or a @sha256 digest}"
 
-HEAD="${HEAD:-http://localhost:8080}"
+HEAD="${HEAD:-https://lettuce-compute.gridlabs.science}"
 ADMIN_KEY="${ADMIN_KEY:-dev-admin-key-not-for-production}"
 LEAF_ID="${LEAF_ID:-ebb492bd-ca4c-4737-8769-f7dae060ac78}"
 
@@ -37,8 +37,9 @@ curl -s -X PUT "$HEAD/api/v1/leafs/$LEAF_ID" \
       "image": "'"$IMAGE_ID"'",
       "gpu_required": true,
       "max_memory_mb": 8192,
-      "max_disk_mb": 1024,
-      "max_cpu_seconds": 3600
+      "max_disk_mb": 20480,
+      "max_cpu_seconds": 3600,
+      "network_access": true
     },
     "validation_config": {
       "redundancy_factor": 1,

@@ -76,6 +76,10 @@ services:
       # browser volunteer in the dashboard calls this REST API cross-origin in dev.
       # CORS now fails closed when unset, so dev must allowlist the dashboard origin.
       LETTUCE_CORS_ORIGINS: http://localhost:3000
+      # Local dev admin user so the leaf-authoring API (creator_id) works against
+      # the dry-run stack. NOT for production — the production head sets these in .env.
+      LETTUCE_ADMIN_EMAIL: dev-admin@local.dev
+      LETTUCE_ADMIN_PASSWORD: dev-admin-password-not-for-production
     ports:
       - "8080:8080"
       - "9090:9090"
